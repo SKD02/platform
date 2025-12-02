@@ -13,3 +13,6 @@ pdf2image
 pymupdf
 pillow
 bs4
+pypdf
+pdfminer.six
+google-generativeai
