@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+httpx
+requests
+openai
+pydantic
+email-validator
+python-multipart
+psycopg[binary]
+pandas
+lxml
+pdf2image
+pymupdf
+pillow
