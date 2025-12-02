@@ -12,3 +12,4 @@ lxml
 pdf2image
 pymupdf
 pillow
+bs4
