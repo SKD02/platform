@@ -1,6 +1,7 @@
 import pandas as pd
 from db import get_declaration_date
 import re
+import streamlit as st
 from decimal import Decimal, InvalidOperation
 from typing import Any, List, Tuple, Dict
 from datetime import datetime, date
@@ -68,6 +69,11 @@ def get_any(d: dict, paths, default=""):
 BASE_DIR = Path(__file__).resolve().parent
 CLASSIF_DIR = BASE_DIR / "classifier"
 
+COUNTRIES_CSV   = CLASSIF_DIR / "countries_classificator.csv"
+UNITS_CSV       = CLASSIF_DIR / "15 — КЛАССИФИКАТОР ЕДИНИЦ ИЗМЕРЕНИЯ.csv"
+INCOTERMS_CSV   = CLASSIF_DIR / "13 — КЛАССИФИКАТОР УСЛОВИЙ ПОСТАВКИ.csv"
+
+
 @lru_cache()
 def get_country_mapping() -> Dict[str, str]:
     """
@@ -124,7 +130,7 @@ def normalize_country(country_str):
 
 
 def get_country_code(name: str) -> str:
-    countries = pd.read_csv(r"C:\Users\sidor\Desktop\streamlit\countries_classificator.csv")
+    countries = pd.read_csv(COUNTRIES_CSV)
     if not name or pd.isna(name):
         return ""
     
@@ -159,7 +165,7 @@ def get_country_name(code: str) -> str:
         return ""
 
     # читаем классификатор
-    countries = pd.read_csv(r"C:\Users\sidor\Desktop\streamlit\countries_classificator.csv")
+    countries = pd.read_csv(COUNTRIES_CSV)
 
     code = str(code).strip().upper()
     for _, row in countries.iterrows():
@@ -211,7 +217,12 @@ def get_total_places(data: dict) -> int:
         s = str(val).strip()
         nums = re.findall(r"\d+", s)
         if nums:
-            total += sum(int(n) for n in nums)
+            try:
+                total += sum(int(n) for n in nums)
+            except Exception:
+                st.warning(f"Не удалось преобразовать: {s}")
+        else:
+            st.warning(f"Нет числа в значении 'Количество мест': {s}")
 
     return total
 
@@ -232,7 +243,7 @@ def get_product_country(data: dict) -> str:
 
 def get_unit_tnved(data: dict) -> tuple[dict, dict, dict]:
     # 1) Классификатор ЕИ
-    units_df = pd.read_csv(r"C:\Users\sidor\Desktop\streamlit\alta_classifiers\15 — КЛАССИФИКАТОР ЕДИНИЦ ИЗМЕРЕНИЯ.csv",dtype=str).fillna("")
+    units_df = pd.read_csv(UNITS_CSV, dtype=str).fillna("")
     code_to_short = {}
     variant_to_code = {}
     code_to_name = {str(row["Код"]).strip(): str(row["Наименование"]).strip()
@@ -326,7 +337,7 @@ def get_unit_tnved(data: dict) -> tuple[dict, dict, dict]:
 
     return qty_by_tnved, unit_name_by_tnved, unit_code_by_tnved
 
-def get_units_product(data: dict,units_csv_path: str = r"C:\Users\sidor\Desktop\streamlit\alta_classifiers\15 — КЛАССИФИКАТОР ЕДИНИЦ ИЗМЕРЕНИЯ.csv",joiner: str = "\n",) -> dict[str, str]:
+def get_units_product(data: dict,units_csv_path: str = UNITS_CSV,joiner: str = "\n",) -> dict[str, str]:
     units_df = pd.read_csv(units_csv_path, dtype=str).fillna("")
     code_to_name = {}
     code_to_short = {}
@@ -903,7 +914,7 @@ def _is_unknown(s: str) -> bool:
 
 def collect_origin_values(data: dict) -> list:
     """Собрать все значения 'Страна-производитель' из invoice.Товары и packing.Перевозка.Товары."""
-    countries = pd.read_csv(r"C:\Users\sidor\Desktop\streamlit\countries_classificator.csv")
+    countries = pd.read_csv(COUNTRIES_CSV)
     # допустимые варианты (берём все колонки: Код, Alpha2, Alpha3, Name и т.п.)
     valid_countries = set()
     for col in countries.columns:
@@ -1195,7 +1206,7 @@ def get_incoterms(incoterms_str):
         return "", ""
 
     # читаем справочник кодов
-    inc = pd.read_csv(r"C:\Users\sidor\Desktop\streamlit\alta_classifiers\13 — КЛАССИФИКАТОР УСЛОВИЙ ПОСТАВКИ.csv", dtype=str)
+    inc = pd.read_csv(INCOTERMS_CSV, dtype=str)
     codes = [str(x).strip().upper() for x in inc["Код условия поставки"].dropna().tolist()]
 
     up = s.upper()
@@ -1523,6 +1534,5 @@ def get_all_docx(data: dict, g25_1: str) -> Dict[str, List[str]]:
         )
         t_nm = first_non_empty(tr_info, ["Наименование документа", "Название документа", "Тип документа"])
         add_doc(t_code, t_num, t_dt, t_nm)
-
 
     return out
