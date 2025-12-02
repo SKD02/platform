@@ -2,7 +2,6 @@ import pandas as pd
 from db import get_declaration_date
 import re
 from decimal import Decimal, InvalidOperation
-import streamlit as st
 from typing import Any, List, Tuple, Dict
 from datetime import datetime, date
 import re, difflib
@@ -212,12 +211,7 @@ def get_total_places(data: dict) -> int:
         s = str(val).strip()
         nums = re.findall(r"\d+", s)
         if nums:
-            try:
-                total += sum(int(n) for n in nums)
-            except Exception:
-                st.warning(f"Не удалось преобразовать: {s}")
-        else:
-            st.warning(f"Нет числа в значении 'Количество мест': {s}")
+            total += sum(int(n) for n in nums)
 
     return total
 
@@ -1529,5 +1523,6 @@ def get_all_docx(data: dict, g25_1: str) -> Dict[str, List[str]]:
         )
         t_nm = first_non_empty(tr_info, ["Наименование документа", "Название документа", "Тип документа"])
         add_doc(t_code, t_num, t_dt, t_nm)
+
 
     return out
