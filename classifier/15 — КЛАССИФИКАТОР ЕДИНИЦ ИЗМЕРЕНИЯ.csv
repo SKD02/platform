@@ -1,0 +1,27 @@
+﻿Код,Наименование,Условное обозначение,Наименование_EN,Сокращение_EN,Дополнительно
+006,МЕТР,М,METER
+055,КВАДРАТНЫЙ МЕТР,М2,SQUARE METER, SQ.M, M2
+112,ЛИТР,Л,LITRE, LITER,L
+113,КУБИЧЕСКИЙ МЕТР,М3, CUBIC METER,M3, CU.M
+114,1000 КУБИЧЕСКИХ МЕТРОВ,1000 М3,THOUSAND CUBIC METRES, THOUSAND CUBIC METERS,1000 M3
+130,1000 ЛИТРОВ,1000 Л,THOUSAND LITRES,1000 L
+162,МЕТРИЧЕСКИЙ КАРАТ (1 КАРАТ = 2 X 10 (-4) КГ),КАР,METRIC CARAT,CT
+163,ГРАММ,Г,GRAM,G
+166,КИЛОГРАММ,КГ,KILOGRAM,KG
+185,ГРУЗОПОДЪЕМНОСТЬ В ТОННАХ,Т ГРП,TONNE CAPACITY,T
+246,1000 КИЛОВАТТ-ЧАС,1000 КВТ*Ч,THOUSAND KILOWATT HOUR,1000 KWH
+305,КЮРИ,КИ,CURIE,CI
+306,ГРАММ ДЕЛЯЩИХСЯ ИЗОТОПОВ,Г Д/И,GRAM OF FISSILE ISOTOPES,G FISSILE
+715,ПАРА,ПАР,PAIR,PAIRS
+796,ШТУКА,ШТ,SET,PCS,PIECE
+797,СТО ШТУК,100 ШТ,HUNDRED PIECES,100 PCS
+798,ТЫСЯЧА ШТУК,1000 ШТ,THOUSAND PIECES,1000 PCS
+831,ЛИТР ЧИСТОГО (100%) СПИРТА,Л 100% СПИРТА,LITRE OF PURE ALCOHOL,L ALC 100%
+841,КИЛОГРАММ ПЕРОКСИДА ВОДОРОДА,КГ H2O2,KILOGRAM OF HYDROGEN PEROXIDE,KG H2O2
+845,КИЛОГРАММ СУХОГО НА 90% ВЕЩЕСТВА,КГ 90% С/В,KILOGRAM OF 90% DRY SUBSTANCE,KG 90% D.S.
+852,КИЛОГРАММ ОКСИДА КАЛИЯ,КГ K2O,KILOGRAM OF POTASSIUM OXIDE,KG K2O
+859,КИЛОГРАММ ГИДРОКСИДА КАЛИЯ,КГ KOH,KILOGRAM OF POTASSIUM HYDROXIDE,KG KOH
+861,КИЛОГРАММ АЗОТА,КГ N,KILOGRAM OF NITROGEN,KG N
+863,КИЛОГРАММ ГИДРОКСИДА НАТРИЯ,КГ NAOH,KILOGRAM OF SODIUM HYDROXIDE,KG NAOH
+865,КИЛОГРАММ ПЯТИОКИСИ ФОСФОРА,КГ P2O5,KILOGRAM OF PHOSPHORUS PENTOXIDE,KG P2O5
+867,КИЛОГРАММ УРАНА,КГ U,KILOGRAM OF URANIUM,KG U
