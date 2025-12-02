@@ -1,7 +1,6 @@
 import pandas as pd
 from db import get_declaration_date
 import re
-import streamlit as st
 from decimal import Decimal, InvalidOperation
 from typing import Any, List, Tuple, Dict
 from datetime import datetime, date
@@ -217,12 +216,8 @@ def get_total_places(data: dict) -> int:
         s = str(val).strip()
         nums = re.findall(r"\d+", s)
         if nums:
-            try:
-                total += sum(int(n) for n in nums)
-            except Exception:
-                st.warning(f"Не удалось преобразовать: {s}")
-        else:
-            st.warning(f"Нет числа в значении 'Количество мест': {s}")
+            total += sum(int(n) for n in nums)
+
 
     return total
 
