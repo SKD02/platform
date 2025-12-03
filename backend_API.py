@@ -1558,6 +1558,22 @@ def job_status(job_id: int):
 def jobs_by_decl(decl_id: int):
     return jobs_list_by_decl(decl_id)
 
+def persist_doc_json(decl_id: int, user_id: int, doc_key: str, data: dict):
+    dk = f"{doc_key}_json"
+
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = f"{dk}.json"
+
+    linked = list_declaration_files(decl_id) or []
+    for r in linked:
+        if str(r.get("doc_key") or "") == dk:
+            try:
+                unlink_file_from_declaration(decl_id, r["file_id"])
+            except Exception:
+                pass
+
+    new_file_id = add_file(user_id, filename, "application/json", payload)
+    link_file_to_declaration(decl_id, new_file_id, dk)
 
 def worker_loop():
     while not _stop.is_set():
@@ -1570,14 +1586,16 @@ def worker_loop():
             rec = get_file(fid)
             blob, fname = rec["file_data"], rec["filename"]
             mime = rec.get("mime")
-            result = call_yandexgpt(blob, fname, doc_key, mime=mime)  # OCR->LLM
+            result = call_yandexgpt(blob, fname, doc_key, mime=mime) 
 
-            # только теперь считаем, что job готова
             jobs_finish_ok(jid, result)
+            user_id = rec.get("user_id")  
+            persist_doc_json(job["decl_id"], user_id, doc_key, result)  
             time.sleep(1)
 
         except Exception:
             jobs_finish_err(jid, traceback.format_exc())
+
 
 
 ############### ЕГРЮЛ API OFDATA ###############
