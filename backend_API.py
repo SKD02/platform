@@ -4757,20 +4757,22 @@ def fill_ESADout_CU_with_gt(payload: Dict[str, Any]) -> ESADout_CU:
     )
 
     location_address = SubjectAddressDetails(
-        country_code="RU",
-        country_name="РОССИЯ",
-        region="",
-        city="",
-        street_house="",
-        house="",
+        country_code=payload.get("g30_country_code", ""),
+        country_name=payload.get("g30_country_name", ""),
+        region=payload.get("g30_region", ""),
+        city=payload.get("g30_city", ""),
+        street_house=payload.get("g30_street_house", ""),
+        house="", 
     )
 
     goods_location = ESADout_CUGoodsLocation(
-        information_type_code=payload.get("g30_1",""),
-        customs_office=payload.get("g30_2", ""),
-        customs_country_code="RU",
-        location_name="",
-        register_document_id_details=RegisterDocumentIdDetails(doc_id=payload.get("g30_4","")),
+        information_type_code=payload.get("g30_1", ""),           
+        customs_office=payload.get("g30_2", ""),                   
+        customs_country_code=payload.get("g30_country_code", "RU"),
+        location_name="",                                         
+        register_document_id_details=RegisterDocumentIdDetails(
+            doc_id=payload.get("g30_license_number", "")
+        ),
         address=location_address,
     )
 
