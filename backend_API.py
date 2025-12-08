@@ -1526,6 +1526,7 @@ app = FastAPI(title="VED Declarant API", version="1.0", lifespan=lifespan)
 
 # ----- CORS для React -----
 origins = [
+    "http://cr976502.tw1.ru",
     "https://cr976502.tw1.ru"
 ]
 
