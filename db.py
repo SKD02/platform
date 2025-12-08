@@ -348,7 +348,7 @@ def add_declaration(
     title: str,
     created_at: Optional[datetime] = None,
     #goods_description: Optional[str] = None,
-    #tnved_code: Optional[str] = None,
+    #: Optional[str] = None,
     attached_file_id: Optional[int] = None,
     meta_json: Optional[Union[str, dict]] = None
 ) -> int:
@@ -393,7 +393,7 @@ def list_declarations(user_id: int, limit: int = 200) -> List[Dict[str, Any]]:
 
 def update_declaration(decl_id: int, **fields) -> None:
     """
-    Обновить поля декларации (например, meta_json, title, tnved_code...).
+    Обновить поля декларации (например, meta_json, title, ...).
     Передавать только те поля, которые реально нужны.
     """
     allowed = {"title", "attached_file_id", "meta_json"}
@@ -595,6 +595,7 @@ def save_overrides(decl_id: int, overrides: Dict[str, Any]) -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(q, (json.dumps(overrides, ensure_ascii=False), decl_id))
         conn.commit()
+
 
 
 
