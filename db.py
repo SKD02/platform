@@ -15,19 +15,19 @@ PG_USER      = os.getenv("PG_USER", "postgres")
 PG_PASSWORD  = os.getenv("PG_PASSWORD", "1234")
 
 TARGET_DSN = (
-    f"dbname={PG_DB}"
-    f"user={PG_USER}" 
-    f"password={PG_PASSWORD}"
-    f"host={PG_HOST}"
-    f"port={PG_PORT}"
+    f"dbname={PG_DB} "
+    f"user={PG_USER} " 
+    f"password={PG_PASSWORD} "
+    f"host={PG_HOST} "
+    f"port={PG_PORT} "
 )
 
 ADMIN_DSN = (
-    f"dbname=postgres"
-    f"user={PG_USER}"
-    f"password={PG_PASSWORD}"
-    f"host={PG_HOST}"
-    f"port={PG_PORT}"
+    f"dbname=postgres "
+    f"user={PG_USER} "
+    f"password={PG_PASSWORD} "
+    f"host={PG_HOST} "
+    f"port={PG_PORT} "
 )
 
 ################## Подключение к DB ##################
@@ -614,6 +614,7 @@ def save_overrides(decl_id: int, overrides: Dict[str, Any]) -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(q, (json.dumps(overrides, ensure_ascii=False), decl_id))
         conn.commit()
+
 
 
 
