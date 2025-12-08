@@ -693,6 +693,24 @@ def _norm_str(v):
     s = " ".join(s.split())
     return s
 
+def _is_eu_label(s: str) -> bool:
+    if not s:
+        return False
+    up = s.upper()
+    if any(tok in up for tok in ("ЕВРОСОЮЗ", "EUROPEAN UNION")):
+        return True
+    if up.strip() in ("EU", "ЕВРОСОЮЗ"):
+        return True
+    if "EURO" in up and not re.search(r"\b[A-Z]{2,}\b", up):
+        return True
+    return False
+
+def _is_unknown(s: str) -> bool:
+    if not s:
+        return True
+    up = s.upper().strip()
+    return up in ("", "-", "N/A", "UNKNOWN", "НЕИЗВЕСТНО", "НЕИЗВЕСТНА", "NO DATA")
+
 def collect_origin_values(data: dict) -> list:
     countries = pd.read_csv(COUNTRIES_CSV)
     valid_countries = set()
@@ -1078,3 +1096,4 @@ def get_all_docx(data: dict, g25_1: str) -> Dict[str, List[str]]:
         add_doc(t_code, t_num, t_dt, t_nm)
 
     return out
+
