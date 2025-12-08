@@ -16,3 +16,5 @@ bs4
 pypdf
 pdfminer.six
 google-generativeai
+docx
+io
