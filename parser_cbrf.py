@@ -8,8 +8,6 @@ import csv
 BASE_URL = "https://www.cbr.ru/currency_base/daily/"
 
 def _decimal_of_raw(s) -> Decimal:
-    """Превратить сырой текст строки '11,0648' -> Decimal('11.0648').
-       Убираем пробелы/NBSP, заменяем запятую на точку, безопасно парсим Decimal."""
     if s is None:
         return Decimal("0")
     t = str(s).strip()
@@ -36,8 +34,6 @@ def cb_rate(date_ddmmyyyy: str, currency_code: str) -> Decimal:
                     data = rows[1:]
                 else:
                     data = rows
-
-                # маленькая таблица «латиница -> кириллица» для похожих букв
                 lat2cyr = {
                     "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К",
                     "M": "М", "O": "О", "P": "Р", "T": "Т", "X": "Х", "Y": "У"
@@ -63,7 +59,6 @@ def cb_rate(date_ddmmyyyy: str, currency_code: str) -> Decimal:
 
                     if not alph:
                         continue
-                    # сравниваем уже «починенные» строки
                     if norm_inp and norm_inp == name_fixed:
                         alpha = alph
                         break
@@ -100,13 +95,12 @@ def cb_rate(date_ddmmyyyy: str, currency_code: str) -> Decimal:
     found = None
     for row in rows:
         col_upper = [c.strip().upper() for c in row]
-        if effective_code in col_upper:  # <-- здесь ищем уже по букв. коду
+        if effective_code in col_upper:  
             found = row
             break
 
     if not found:
         return f"В таблице не найдена валюта {effective_code} на дату {date_ddmmyyyy}"
-    # индексы, как у тебя было
     idx_rate = len(found) - 1
     idx_units = 2 if len(found) > 2 else 2
 
