@@ -2,31 +2,29 @@
 import os, io, base64, json, time, random, requests, re
 from typing import List, Dict, Any, Optional, Tuple
 from pdf2image import convert_from_bytes
-import fitz  # PyMuPDF
+import fitz
 from hashlib import sha256
 from threading import Lock
 from PIL import Image
 
-# ---- Конфиг через переменные окружения ----
-YC_API_KEY   = os.getenv("YC_API_KEY")          # Api-Key из Яндекса
-YC_FOLDER_ID = os.getenv("YC_FOLDER_ID")        # ID каталога
+YC_API_KEY   = os.getenv("YC_API_KEY")         
+YC_FOLDER_ID = os.getenv("YC_FOLDER_ID")     
 VISION_URL   = os.getenv(
     "YC_VISION_URL",
     "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
 )
 
-# Лимиты / дросселирование
-OCR_MIN_INTERVAL_SEC = 1.1  # 1 RPS sync
+
+OCR_MIN_INTERVAL_SEC = 1.1  
 OCR_MAX_RETRIES      = 2
 OCR_BACKOFF_BASE     = 1.8
 OCR_BACKOFF_MAX      = 30
 
-# Ограничения Vision
-MAX_PDF_BYTES        = 10 * 1024 * 1024   # 10 MB
-MAX_IMAGE_MEGAPIX    = 20.0               # 20 MP (W*H <= 20e6)
+
+MAX_PDF_BYTES        = 10 * 1024 * 1024   
+MAX_IMAGE_MEGAPIX    = 20.0              
 BATCH_PAGE_CHUNK     = 3
 
-# Конвертация PDF -> JPEG
 PDF_DPI              = 300
 JPEG_QUALITY         = 80
 
@@ -34,11 +32,9 @@ _last_ocr_ts = 0.0
 _last_ocr_lock = Lock()
 _OCR_CACHE: Dict[str, Dict[str, Any]] = {}
 
-# ---------------- Исключения ----------------
 class YCOCRError(Exception):
     pass
 
-# ---------------- Утилиты ----------------
 def _headers() -> Dict[str, str]:
     if not YC_API_KEY:
         raise YCOCRError("YC_API_KEY is not set")
@@ -59,7 +55,6 @@ def _fp(b: bytes) -> str:
 def _chunked(lst: List[bytes], n: int) -> List[List[bytes]]:
     return [lst[i:i+n] for i in range(0, len(lst), n)]
 
-# ---------------- PDF helpers ----------------
 def has_embedded_text(pdf_bytes: bytes) -> bool:
     try:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -99,7 +94,6 @@ def pdf_to_jpegs_capped(pdf_bytes: bytes,
                         dpi: int = PDF_DPI,
                         quality: int = JPEG_QUALITY,
                         max_pages: Optional[int] = None) -> List[bytes]:
-    """PDF -> JPEG; даунскейл до <=20MP, сжатие JPEG."""
     pil_pages = convert_from_bytes(pdf_bytes, dpi=dpi)
     out: List[bytes] = []
     for i, im in enumerate(pil_pages):
@@ -111,12 +105,10 @@ def pdf_to_jpegs_capped(pdf_bytes: bytes,
         out.append(buf.getvalue())
     return out
 
-# ---------------- HTTP с ретраями ----------------
 def _post_with_retry(url: str, headers: dict, payload: dict) -> requests.Response:
     global _last_ocr_ts
     attempt = 0
     while True:
-        # троттлинг 1 rps
         with _last_ocr_lock:
             now = time.time()
             d = now - _last_ocr_ts
@@ -135,16 +127,12 @@ def _post_with_retry(url: str, headers: dict, payload: dict) -> requests.Respons
                 attempt += 1
                 continue
             raise
-
-        # успех
         if r.status_code < 400:
             return r
 
-        # 413 = Payload Too Large (для PDF чаще всего) — сразу не ретраим, а даём вывалиться
         if r.status_code == 413:
             r.raise_for_status()
 
-        # 429/503 — бэкофф и повтор
         if r.status_code in (429, 503) and attempt < OCR_MAX_RETRIES:
             retry_after = r.headers.get("Retry-After")
             if retry_after:
@@ -159,10 +147,8 @@ def _post_with_retry(url: str, headers: dict, payload: dict) -> requests.Respons
             attempt += 1
             continue
 
-        # прочие ошибки — как есть
         r.raise_for_status()
 
-# ---------------- Вызовы Vision ----------------
 def yc_vision_ocr_document(file_bytes: bytes, mime_type: str) -> Dict[str, Any]:
     payload = {
         "analyze_specs": [{
@@ -202,7 +188,6 @@ def yc_vision_ocr_images(img_bytes_list: List[bytes], langs: Optional[List[str]]
             all_results.extend(j["results"])
     return {"results": all_results}
 
-# ---------------- Парсинг ответа в текст ----------------
 def parse_vision_response_to_text(resp: Dict[str, Any]) -> str:
     lines: List[str] = []
     for spec_result in resp.get("results", []) or []:
@@ -223,18 +208,14 @@ def parse_vision_response_to_text(resp: Dict[str, Any]) -> str:
                                 lines.append(" ".join(words))
     
     text = "\n".join(s.strip() for s in lines if str(s).strip())
-
-    # Убираем служебные маркеры (<hw_0>, <rot_0>, <...>)
     text = re.sub(r"<(hw|rot)_[0-9]+>", "", text)
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
 
-# ---------------- Публичные entry-пойнты ----------------
+
 def extract_text_smart(file_bytes: bytes, mime: str) -> str:
     mime = (mime or "").lower().strip()
-
-    # PDF: сначала — embedded
     if mime == "application/pdf":
         embedded = ""
         if has_embedded_text(file_bytes):
@@ -242,25 +223,20 @@ def extract_text_smart(file_bytes: bytes, mime: str) -> str:
         
         if len(embedded) >= 100:
             return embedded
-
-        # Попытка: весь PDF как документ (если ≤ 10MB)
         if len(file_bytes) <= MAX_PDF_BYTES:
             try:
                 resp = yc_vision_ocr_document(file_bytes, mime_type="application/pdf")
                 return parse_vision_response_to_text(resp)
             except requests.HTTPError as e:
-                # 413/429/и т.п. — уйдём на jpeg-страницы
                 if e.response is None or e.response.status_code in (413, 429, 503):
                     pass
                 else:
                     raise
 
-        # Фолбэк: режем на JPEG-страницы и шлём батчами
         imgs = pdf_to_jpegs_capped(file_bytes, dpi=PDF_DPI, quality=JPEG_QUALITY)
         resp = yc_vision_ocr_images(imgs)
         return parse_vision_response_to_text(resp)
 
-    # Изображения
     if "png" in mime:
         mt = "image/png"
     else:
@@ -269,7 +245,6 @@ def extract_text_smart(file_bytes: bytes, mime: str) -> str:
         resp = yc_vision_ocr_document(file_bytes, mime_type=mt)
         return parse_vision_response_to_text(resp)
     except requests.HTTPError:
-        # редкая ситуация — можно попробовать как есть JPEG (иногда помогает перекодирование)
         try:
             im = Image.open(io.BytesIO(file_bytes))
             im = _cap_megapixels(im, MAX_IMAGE_MEGAPIX)
@@ -295,12 +270,10 @@ def extract_text_with_meta(file_bytes: bytes, mime: str) -> Tuple[str, Dict[str,
             embedded_txt = extract_text_from_pdf_bytes(file_bytes)
 
         if len(embedded_txt) >= 100:
-            # считаем embedded нормальным, OCR не нужен
             text = embedded_txt
             source = "embedded"
             ocr_used = False
         else:
-            # embedded пустой или слишком короткий -> запускаем OCR
             if len(file_bytes) <= MAX_PDF_BYTES:
                 resp = yc_vision_ocr_document(file_bytes, mime_type="application/pdf")
             else:
@@ -311,7 +284,6 @@ def extract_text_with_meta(file_bytes: bytes, mime: str) -> Tuple[str, Dict[str,
             source = "yandex_vision"
             ocr_used = True
     else:
-        # Картинки: сразу OCR
         mt = "image/png" if "png" in mime_norm else "image/jpeg"
         resp = yc_vision_ocr_document(file_bytes, mime_type=mt)
         text = parse_vision_response_to_text(resp)
