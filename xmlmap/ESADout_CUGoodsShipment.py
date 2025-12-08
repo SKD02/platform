@@ -1009,24 +1009,40 @@ class ESADCustomsProcedure(IXMLElement):
         return elem
 
 
-class ESADout_CUGoods(IXMLElement):
-    """Класс для ESADout_CUGoods (Товары)"""
-    
-    def __init__(self, goods_numeric: str = None, goods_descriptions: str = None, #SKD List[str] 
-                 gross_weight_quantity: str = None, net_weight_quantity: str = None,
-                 invoiced_cost: str = None, customs_cost: str = None,
-                 statistical_cost: str = None, goods_tnved_code: str = None, additions_sign: str = None,
-                 intellect_property_sign: str = None, origin_country_code: str = None,
-                 customs_cost_correct_method: str = None, additional_sheet_count: str = None,
-                 goods_group_description: GoodsGroupDescription = None,
-                 preferencii: Preferencii = None, language_goods: str = None,
-                 presented_documents: List[ESADout_CUPresentedDocument] = None,
-                 customs_payment_calculations: List[ESADout_CUCustomsPaymentCalculation] = None,
-                 supplementary_goods_quantity: SupplementaryGoodsQuantity = None,
-                 esad_goods_packaging: ESADGoodsPackaging = None,
-                 esad_customs_procedure: ESADCustomsProcedure = None):
+class ESADout_CUGoods(IXMLElement):  
+    def __init__(
+        self,
+        goods_numeric: str = None,
+        goods_descriptions: str = None,  #
+        gross_weight_quantity: str = None,
+        net_weight_quantity: str = None,
+        invoiced_cost: str = None,
+        customs_cost: str = None,
+        statistical_cost: str = None,
+        goods_tnved_code: str = None,
+        additions_sign: str = None,
+        intellect_property_sign: str = None,
+        origin_country_code: str = None,
+        customs_cost_correct_method: str = None,
+        additional_sheet_count: str = None,
+        goods_group_description=None,
+        preferencii: Preferencii = None,
+        language_goods: str = None,
+        presented_documents: List[ESADout_CUPresentedDocument] = None,
+        customs_payment_calculations: List[ESADout_CUCustomsPaymentCalculation] = None,
+        supplementary_goods_quantity: SupplementaryGoodsQuantity = None,
+        esad_goods_packaging: ESADGoodsPackaging = None,
+        esad_customs_procedure: ESADCustomsProcedure = None,
+    ):
         self.goods_numeric = goods_numeric
-        self.goods_descriptions = goods_descriptions or []
+
+        if goods_descriptions is None:
+            self.goods_descriptions: List[str] = []
+        elif isinstance(goods_descriptions, (list, tuple)):
+            self.goods_descriptions = list(goods_descriptions)
+        else:
+            self.goods_descriptions = [str(goods_descriptions)]
+
         self.gross_weight_quantity = gross_weight_quantity
         self.net_weight_quantity = net_weight_quantity
         self.invoiced_cost = invoiced_cost
@@ -1037,7 +1053,14 @@ class ESADout_CUGoods(IXMLElement):
         self.origin_country_code = origin_country_code
         self.customs_cost_correct_method = customs_cost_correct_method
         self.additional_sheet_count = additional_sheet_count
-        self.goods_group_description = goods_group_description
+
+        if goods_group_description is None:
+            self.goods_group_description: List[GoodsGroupDescription] = []
+        elif isinstance(goods_group_description, (list, tuple)):
+            self.goods_group_description = list(goods_group_description)
+        else:
+            self.goods_group_description = [goods_group_description]
+
         self.preferencii = preferencii
         self.language_goods = language_goods
         self.presented_documents = presented_documents or []
@@ -1109,8 +1132,8 @@ class ESADout_CUGoods(IXMLElement):
             sheet_elem.text = self.additional_sheet_count
             elem.append(sheet_elem)
         
-        if self.goods_group_description:
-            elem.append(self.goods_group_description.to_xml())
+        for ggd in self.goods_group_description:
+            elem.append(ggd.to_xml())
         
         if self.preferencii:
             elem.append(self.preferencii.to_xml())
@@ -1136,6 +1159,7 @@ class ESADout_CUGoods(IXMLElement):
             elem.append(self.esad_customs_procedure.to_xml())
         
         return elem
+
 
 
 # Классы для платежей
