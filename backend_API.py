@@ -3199,6 +3199,7 @@ def compute_g30(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
     g30_3 = overrides.get("g30_3", default_g30_3)
 
     svh = {}
+    name = ""
     license_number = ""
     license_date = ""
     address = ""
@@ -3217,6 +3218,7 @@ def compute_g30(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
     if isinstance(svh, dict) and svh:
         first = next(iter(svh.values()))
         if isinstance(first, dict):
+            name           = first.get("Наименование СВХ", "") or ""
             license_number = first.get("Номер лицензии", "") or ""
             license_date   = first.get("Дата лицензии", "") or ""
             address        = first.get("Адрес", "") or ""
@@ -3226,6 +3228,7 @@ def compute_g30(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
             city           = first.get("City", "") or ""
             street_house   = first.get("StreetHouse", "") or ""
 
+    g30_svh_name       = overrides.get("g30_svh_name", name)
     g30_license_number = overrides.get("g30_license_number", license_number)
     g30_license_date   = overrides.get("g30_license_date", license_date)
     g30_address        = overrides.get("g30_address", address)
@@ -3240,6 +3243,7 @@ def compute_g30(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
         "g30_1": g30_1,
         "g30_2": g30_2,
         "g30_3": g30_3,
+        "g30_svh_name": g30_svh_name,
         "g30_license_number": g30_license_number,
         "g30_license_date": g30_license_date,
         "g30_address": g30_address,
