@@ -1548,7 +1548,9 @@ app = FastAPI(title="VED Declarant API", version="1.0", lifespan=lifespan)
 # ----- CORS для React -----
 origins = [
     "https://ai-declar.ru",
-    "http://ai-declar.ru"
+    "http://ai-declar.ru",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
 ]
 
 app.add_middleware(
