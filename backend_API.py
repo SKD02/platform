@@ -1,8 +1,9 @@
 ################## ИМПОРТЫ ##################
 import os, time, traceback, json, threading, re, httpx, openai, io
+from passlib.context import CryptContext
 from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
-from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Query, Body
+from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from datetime import date
@@ -38,7 +39,8 @@ from db import (
     save_overrides,
     get_declaration_invoice_json,
     save_declaration_invoice_json,
-    get_declaration_user_id
+    get_declaration_user_id,
+    get_conn
 )
 
 from yandex_ocr import extract_text_with_meta
@@ -1183,7 +1185,6 @@ def json_schema_for(doc_key: str) -> dict:
     # -------------------- fallback --------------------
     return {"name": "Generic", "schema": {"type": "object"}}
 
-
 def _take_10digits(s: str) -> str:
     if not s: return ""
     m = re.search(r"\b(\d{10})\b", s.replace(" ", ""))
@@ -1204,90 +1205,289 @@ def _norm_percent(s: str) -> str:
     val = float(m.group(1))
     return f"{int(val)}%" if abs(val - round(val)) < 1e-9 else f"{val}%"
 
-def classify_tnved_gpt(items: list[dict]) -> list[dict]:
-    names: list[str] = []
-    name_map: list[str] = []  
+# def classify_tnved_gpt(items: list[dict]) -> list[dict]:
+#     names: list[str] = []
+#     name_map: list[str] = []  
+#     for it in items or []:
+#         name = (it.get("Наименование") or "").strip()
+#         extra = (it.get("Дополнительная информация") or "").strip()
+#         manufacture = (it.get("Производитель") or "").strip()
+#         full = name
+#         if extra and extra.lower() != "null":
+#             full += f" ({extra})"
+#         if manufacture and manufacture.lower() != "null":      
+#             full += f" — Производитель: {manufacture}" 
+#         if full:
+#             names.append(full)
+#             name_map.append(full)
+
+#     if not names:
+#         return [{"Наименование": (it.get("Наименование") or ""), "Код": ""} for it in (items or [])]
+
+#     payload = {"Товары": [{"Наименование": n} for n in names]}
+#     client = gpt_client()
+#     resp = client.responses.create(
+#         model="gpt-5",
+#         tools=[{"type": "web_search"}],
+#         reasoning={"effort": "medium"},
+#         input=[
+#             {"role": "system", "content": "Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и по подготовке текстов для графы 31 декларации на товары. Твоя задача: по краткому описанию товара определить наиболее вероятный 10-значный код ТН ВЭД ЕАЭС, указать ставки платежей и сформировать подробное техническое описание товара. Если предоставленной информации недостаточно для уверенной классификации (нет назначения, материалов, электрических параметров, области применения и т.п.), ты должен сначала получить недостающие сведения через web-поиск по типовым описаниям схожих товаров и уже на основе найденного сформировать итоговое описание. Используй только общедоступные и типовые характеристики, не выдумывай конкретные модели и бренды, если их нет во входных данных"},
+#             {"role": "user", "content":
+#                 "Определи 10-значные коды ТН ВЭД для следующих товаров (у каждого товара могут быть разные коды ТН ВЭД), размер пошлины(%) при импорте в РФ и размер НДС(%) и Готовую формулировку для 31 графы декларации (краткая, без лишних пояснений, с указанием основных отличительных признаков и назначения. Без слов «примерно», «возможно», «как правило»\n"
+#                 f"{json.dumps(payload, ensure_ascii=False)}\n"
+#                 " Верни в формате: \n <Наименование товара из входных данных> ; <Код ТНВЭД>; <Размер пошлины>; <Размер НДС>; <Техническое описание для 31 графы>\n"
+#                 " Если не уверен — всё равно выбери наилучший код.\n"
+#             },
+#         ]
+#     )
+#     text = (resp.output_text or "").strip()
+#     ans: dict[str, str] = {}
+#     for line in text.splitlines():
+#         parts = [p.strip() for p in line.split(";")]
+#         if len(parts) < 2:
+#             continue
+#         left = parts[0] 
+#         right_code = parts[1] if len(parts) >= 2 else ""
+#         duty_raw   = parts[2] if len(parts) >= 3 else ""
+#         vat_raw    = parts[3] if len(parts) >= 4 else ""
+#         decl31 = ";".join(parts[4:]).strip() if len(parts) >= 5 else ""
+
+
+#         code = _take_10digits(right_code)
+#         if not code:
+#             code = _take_10digits(line)
+
+#         duty = _norm_percent(duty_raw) or "0%"
+#         vat  = _norm_percent(vat_raw)  or "0%"
+#         ans[left.lower()] = {"Код": code, "Пошлина": duty, "НДС": vat, "Техническое описание": decl31}
+
+#     out: list[dict] = []
+#     for full in name_map:
+#         key = (full or "").lower()
+#         rec = None
+#         if key in ans:
+#             rec = ans[key]
+#         else:
+#             for k, v in ans.items():
+#                 if k in key or key in k:
+#                     rec = v
+#                     break
+#         if rec:
+#             out.append({"Наименование": full, "Код": rec["Код"], "Пошлина": rec["Пошлина"], "НДС": rec["НДС"], "Техническое описание": rec["Техническое описание"]})
+#         else:
+#             out.append({"Наименование": full, "Код": "", "Пошлина": "", "НДС": "", "Техническое описание": ""})
+#     return out
+
+# def enrich_tnved_if_invoice(parsed: dict, fail_soft: bool = True) -> dict:
+#     try:
+#         if not isinstance(parsed, dict):
+#             return parsed
+#         if parsed.get("_doc_key") not in {"invoice"}:
+#             return parsed
+
+#         goods = parsed.get("Товары")
+#         if not isinstance(goods, list) or not goods:
+#             return parsed
+        
+#         manufacturer = ""
+#         try:
+#             manufacturer = (parsed.get("invoice", {}).get("Отправитель", {}).get("Название компании") or "").strip()
+#         except Exception:
+#             manufacturer = ""
+
+#         items_for_api: list[dict] = []
+#         for it in goods:
+#             if not isinstance(it, dict):
+#                 continue
+#             name  = (it.get("Наименование") or "").strip()
+#             extra = (it.get("Дополнительная информация") or "").strip()
+#             items_for_api.append({"Наименование": name, "Дополнительная информация": extra, "Производитель": manufacturer})
+
+#         tnved_list = classify_tnved_gpt(items_for_api)
+
+#         changed = 0
+#         for i, it in enumerate(goods):
+#             if not isinstance(it, dict) or i >= len(tnved_list):
+#                 continue
+#             code = (tnved_list[i].get("Код")     or "").strip()
+#             duty = (tnved_list[i].get("Пошлина") or "").strip()
+#             vat  = (tnved_list[i].get("НДС")     or "").strip()
+#             decl31 = (tnved_list[i].get("Техническое описание") or "").strip()
+
+#             if code:
+#                 it["Код ТНВЭД"] = code; changed += 1
+#             if duty:
+#                 it["Пошлина"]   = duty
+#             if vat:
+#                 it["НДС"]       = vat
+#             if decl31:
+#                 it["Техническое описание"]   = decl31
+
+#         parsed["_tnved"] = {"status": "ok", "changed": changed, "mode": "overwrite"}
+#         return parsed
+
+#     except Exception as e:
+#         if fail_soft:
+#             parsed["_tnved"] = {"status": "error", "reason": str(e)}
+#             parsed["_tnved_gpt_error"] = str(e)
+#             return parsed
+#         raise RuntimeError(f"TNVED enrichment failed: {e}")
+
+def classify_tnved_gpt(items: list[dict]) -> dict:
+    name_map: list[str] = []
+    packed: list[dict] = []
+
     for it in items or []:
         name = (it.get("Наименование") or "").strip()
         extra = (it.get("Дополнительная информация") or "").strip()
         manufacture = (it.get("Производитель") or "").strip()
+
         full = name
         if extra and extra.lower() != "null":
             full += f" ({extra})"
-        if manufacture and manufacture.lower() != "null":      
-            full += f" — Производитель: {manufacture}" 
-        if full:
-            names.append(full)
-            name_map.append(full)
+        if manufacture and manufacture.lower() != "null":
+            full += f" — Производитель: {manufacture}"
 
-    if not names:
-        return [{"Наименование": (it.get("Наименование") or ""), "Код": ""} for it in (items or [])]
+        if not full:
+            continue
 
-    payload = {"Товары": [{"Наименование": n} for n in names]}
+        name_map.append(full)
+        packed.append({
+            "id": len(packed),
+            "name": full,
+        })
+
+    if not packed:
+        return {"items": [], "groups": {}}
+
+    payload = {"items": packed}
+
+    system_prompt = (
+        "Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и подготовке формулировок для графы 31 ДТ.\n"
+        "Если информации недостаточно (назначение/материал/параметры/область применения) — используй web-поиск по типовым описаниям.\n"
+        "Не выдумывай бренды/модели, если их нет во входе. Используй только типовые/общедоступные характеристики.\n"
+        "Ответ верни СТРОГО одним JSON-объектом без markdown и без пояснений."
+    )
+
+    user_prompt = (
+        "Сделай за ОДИН ответ:\n"
+        "1) Для каждого товара определить 10-значный код ТН ВЭД ЕАЭС и платежи.\n"
+        "2) Для каждого УНИКАЛЬНОГО кода ТН ВЭД сформировать Описание группы.\n\n"
+        f"Вход:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+        "Верни СТРОГО по схеме (только JSON):\n"
+        "{\n"
+        '  "items": [\n'
+        "    {\n"
+        '      "id": number,\n'
+        '      "name": string,\n'
+        '      "tnved_code": string,\n'
+        '      "duty_percent": string,\n'
+        '      "vat_percent": string,\n'
+        '      "excise_percent": string,\n'
+        '      "item_desc31": string\n'
+        "    }\n"
+        "  ],\n"
+        '  "groups": {\n'
+        '    "1234567890": { "group_desc": "..." }\n'
+        "  }\n"
+        "}\n\n"
+        "Ограничения:\n"
+        "- tnved_code: строго 10 цифр.\n"
+        "- item_desc31: короче, чем group_desc, но содержит точные характеристики конкретного товара. 50-100 символов.\n"
+        "- group_desc: 100-150 символов, обобщённое описание группы ТНВЭД.\n"
+        "- Если сомневаешься — всё равно выбери наилучший код.\n"
+    )
+
     client = gpt_client()
     resp = client.responses.create(
         model="gpt-5",
         tools=[{"type": "web_search"}],
         reasoning={"effort": "medium"},
         input=[
-            {"role": "system", "content": "Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и по подготовке текстов для графы 31 декларации на товары. Твоя задача: по краткому описанию товара определить наиболее вероятный 10-значный код ТН ВЭД ЕАЭС, указать ставки платежей и сформировать подробное техническое описание товара. Если предоставленной информации недостаточно для уверенной классификации (нет назначения, материалов, электрических параметров, области применения и т.п.), ты должен сначала получить недостающие сведения через web-поиск по типовым описаниям схожих товаров и уже на основе найденного сформировать итоговое описание. Используй только общедоступные и типовые характеристики, не выдумывай конкретные модели и бренды, если их нет во входных данных"},
-            {"role": "user", "content":
-                "Определи 10-значные коды ТН ВЭД для следующих товаров (у каждого товара могут быть разные коды ТН ВЭД), размер пошлины(%) при импорте в РФ и размер НДС(%) и Готовую формулировку для 31 графы декларации (краткая, без лишних пояснений, с указанием основных отличительных признаков и назначения. Без слов «примерно», «возможно», «как правило»\n"
-                f"{json.dumps(payload, ensure_ascii=False)}\n"
-                " Верни в формате: \n <Наименование товара из входных данных> ; <Код ТНВЭД>; <Размер пошлины>; <Размер НДС>; <Техническое описание для 31 графы>\n"
-                " Если не уверен — всё равно выбери наилучший код.\n"
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ]
     )
+
     text = (resp.output_text or "").strip()
-    ans: dict[str, str] = {}
-    for line in text.splitlines():
-        parts = [p.strip() for p in line.split(";")]
-        if len(parts) < 2:
+    raw = text
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z0-9]*\s*", "", raw).strip()
+        raw = re.sub(r"\s*```$", "", raw).strip()
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        i = raw.find("{")
+        j = raw.rfind("}")
+        if i == -1 or j == -1 or j <= i:
+            raise RuntimeError("Не найден dict")
+        data = json.loads(raw[i:j+1])
+
+    out_items: list[dict] = []
+    got_items = data.get("items") or []
+    if not isinstance(got_items, list):
+        got_items = []
+
+    by_id: dict[int, dict] = {}
+    for rec in got_items:
+        if not isinstance(rec, dict):
             continue
-        left = parts[0] 
-        right_code = parts[1] if len(parts) >= 2 else ""
-        duty_raw   = parts[2] if len(parts) >= 3 else ""
-        vat_raw    = parts[3] if len(parts) >= 4 else ""
-        decl31 = ";".join(parts[4:]).strip() if len(parts) >= 5 else ""
+        try:
+            rid = int(rec.get("id"))
+        except Exception:
+            continue
+        by_id[rid] = rec
 
+    for i, full in enumerate(name_map):
+        rec = by_id.get(i) or {}
+        code = _take_10digits(str(rec.get("tnved_code") or ""))
+        duty = _norm_percent(rec.get("duty_percent")) or "0%"
+        vat  = _norm_percent(rec.get("vat_percent"))  or "0%"
+        exc  = _norm_percent(rec.get("excise_percent")) or "0%"
+        desc = (rec.get("item_desc31") or "")
 
-        code = _take_10digits(right_code)
-        if not code:
-            code = _take_10digits(line)
+        out_items.append({
+            "Наименование": full,
+            "Код": code,
+            "Пошлина": duty,
+            "НДС": vat,
+            "Акциз": exc,
+            "Техническое описание": str(desc).strip(),
+        })
 
-        duty = _norm_percent(duty_raw) or "0%"
-        vat  = _norm_percent(vat_raw)  or "0%"
-        ans[left.lower()] = {"Код": code, "Пошлина": duty, "НДС": vat, "Техническое описание": decl31}
+    groups_out: dict[str, dict] = {}
+    got_groups = data.get("groups") or {}
+    if isinstance(got_groups, dict):
+        for k, v in got_groups.items():
+            code10 = _take_10digits(str(k))
+            if not code10:
+                continue
+            if isinstance(v, dict):
+                gdesc = (v.get("group_desc") or "").strip()
+            else:
+                gdesc = str(v or "").strip()
+            groups_out[code10] = {"Описание группы": gdesc}
 
-    out: list[dict] = []
-    for full in name_map:
-        key = (full or "").lower()
-        rec = None
-        if key in ans:
-            rec = ans[key]
-        else:
-            for k, v in ans.items():
-                if k in key or key in k:
-                    rec = v
-                    break
-        if rec:
-            out.append({"Наименование": full, "Код": rec["Код"], "Пошлина": rec["Пошлина"], "НДС": rec["НДС"], "Техническое описание": rec["Техническое описание"]})
-        else:
-            out.append({"Наименование": full, "Код": "", "Пошлина": "", "НДС": "", "Техническое описание": ""})
-    return out
+    for it in out_items:
+        c = (it.get("Код") or "").strip()
+        if c and c not in groups_out:
+            groups_out[c] = {"Описание группы": ""}
+
+    return {"items": out_items, "groups": groups_out}
 
 def enrich_tnved_if_invoice(parsed: dict, fail_soft: bool = True) -> dict:
     try:
         if not isinstance(parsed, dict):
             return parsed
+
         if parsed.get("_doc_key") not in {"invoice"}:
             return parsed
 
         goods = parsed.get("Товары")
         if not isinstance(goods, list) or not goods:
             return parsed
-        
+
         manufacturer = ""
         try:
             manufacturer = (parsed.get("invoice", {}).get("Отправитель", {}).get("Название компании") or "").strip()
@@ -1300,29 +1500,50 @@ def enrich_tnved_if_invoice(parsed: dict, fail_soft: bool = True) -> dict:
                 continue
             name  = (it.get("Наименование") or "").strip()
             extra = (it.get("Дополнительная информация") or "").strip()
-            items_for_api.append({"Наименование": name, "Дополнительная информация": extra, "Производитель": manufacturer})
+            items_for_api.append({
+                "Наименование": name,
+                "Дополнительная информация": extra,
+                "Производитель": manufacturer
+            })
 
-        tnved_list = classify_tnved_gpt(items_for_api)
+        result = classify_tnved_gpt(items_for_api)
+        tnved_list = (result or {}).get("items") or []
+        groups = (result or {}).get("groups") or {}
 
         changed = 0
         for i, it in enumerate(goods):
             if not isinstance(it, dict) or i >= len(tnved_list):
                 continue
-            code = (tnved_list[i].get("Код")     or "").strip()
-            duty = (tnved_list[i].get("Пошлина") or "").strip()
-            vat  = (tnved_list[i].get("НДС")     or "").strip()
-            decl31 = (tnved_list[i].get("Техническое описание") or "").strip()
+
+            rec = tnved_list[i] if isinstance(tnved_list[i], dict) else {}
+
+            code = (rec.get("Код") or "").strip()
+            duty = (rec.get("Пошлина") or "").strip()
+            vat  = (rec.get("НДС") or "").strip()
+            exc  = (rec.get("Акциз") or "").strip()
+            desc31 = (rec.get("Техническое описание") or "").strip()
 
             if code:
-                it["Код ТНВЭД"] = code; changed += 1
+                it["Код ТНВЭД"] = code
+                changed += 1
             if duty:
-                it["Пошлина"]   = duty
+                it["Пошлина"] = duty
             if vat:
-                it["НДС"]       = vat
-            if decl31:
-                it["Техническое описание"]   = decl31
+                it["НДС"] = vat
+            if exc:
+                it["Акциз"] = exc
+            if desc31:
+                it["Техническое описание"] = desc31
 
-        parsed["_tnved"] = {"status": "ok", "changed": changed, "mode": "overwrite"}
+        parsed["_tnved_groups"] = groups if isinstance(groups, dict) else {}
+
+        parsed["_tnved"] = {
+            "status": "ok",
+            "changed": changed,
+            "mode": "overwrite",
+            "groups_count": len(parsed["_tnved_groups"]),
+            "one_call": True
+        }
         return parsed
 
     except Exception as e:
@@ -1473,17 +1694,14 @@ def call_yandexgpt(file_bytes: bytes, filename: str, doc_key: str, mime: Optiona
     )
     raw = (response.output_text or "").strip()
 
-    # 5) Извлекаем JSON по маркерам, при необходимости — двойной loads; иначе fallback
-    parse_meta = {}                      # держим мету отдельно!
+    parse_meta = {}                     
     parsed = None
 
     chunk = extract_between_markers(raw)
     if chunk is not None:
         try:
-            # пробуем обычный loads
             parsed = json.loads(chunk)
         except Exception as e1:
-            # вдруг там опять строка с JSON — двойной loads
             try:
                 inner = json.loads(chunk)
                 if isinstance(inner, str):
@@ -1545,10 +1763,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="VED Declarant API", version="1.0", lifespan=lifespan)
 
-# ----- CORS для React -----
 origins = [
     "https://ai-declar.ru",
     "http://ai-declar.ru",
+    "https://declarant-ai.ru",
+    "http://declarant-ai.ru",
     "http://localhost:5173",
     "http://127.0.0.1:5173"
 ]
@@ -1726,7 +1945,7 @@ def api_enrich_tnved_for_invoice(decl_id: int, body: TnvedEnrichRequest,):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Ошибка при обогащении ТН ВЭД: {e}",
+            detail=f"Ошибка при определении ТН ВЭД: {e}",
         )
     save_declaration_invoice_json(decl_id, parsed_after)
     return {
@@ -1864,6 +2083,291 @@ def get_company_ofdata(inn: str = Query(..., min_length=10, max_length=12),):
         "raw": company_raw, 
     }
 
+############### TNVED ###############
+
+class DetectIn(BaseModel):
+    manufacturer: str
+    product: str
+    extra: Optional[str] = None
+
+class AltItem(BaseModel):
+    code: Optional[str] = None
+    reason: Optional[str] = None
+
+class Payments(BaseModel):
+    duty: Optional[str] = None
+    vat: Optional[str] = None
+    excise: Optional[str] = None
+    fees: Optional[str] = None
+
+class DetectOut(BaseModel):
+    code: str
+    duty: str
+    vat: str
+    raw: Optional[str] = None
+    description: Optional[str] = None
+    tech31: Optional[str] = None
+    decl31: Optional[str] = None
+    classification_reason: Optional[str] = None
+    alternatives: Optional[List[AltItem]] = None
+    payments: Optional[Payments] = None
+    requirements: Optional[List[str]] = None
+
+class FeedbackIn(BaseModel):
+    acc_code: int
+    desc_31: int
+    reason_clarity: int
+    ui: int
+    comment: Optional[str] = None
+
+    manufacturer: Optional[str] = None
+    product: Optional[str] = None
+    extra: Optional[str] = None
+
+    code: Optional[str] = None
+    tech31: Optional[str] = None
+    decl31: Optional[str] = None
+
+def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    try:
+        start = text.index("{")
+        end = text.rfind("}")
+        blob = text[start:end+1]
+        return json.loads(blob)
+    except Exception:
+        return None
+
+def _stringify_tech31(val) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, dict):
+        parts = []
+        for k, v in val.items():
+            k_s = str(k).strip().capitalize()
+            if isinstance(v, (list, tuple)):
+                v_s = "; ".join(str(x).strip() for x in v if str(x).strip())
+            elif isinstance(v, dict):
+                v_s = "; ".join(f"{kk}: {vv}" for kk, vv in v.items())
+            else:
+                v_s = str(v).strip()
+            if v_s:
+                parts.append(f"- {k_s}: {v_s}")
+        return "\n".join(parts)
+    if isinstance(val, (list, tuple)):
+        return "\n".join(f"- {str(x).strip()}" for x in val if str(x).strip())
+    return str(val).strip()
+
+def _normalize_alternatives(val):
+    out = []
+    if isinstance(val, dict):
+        for k, v in val.items():
+            out.append({"code": str(k), "reason": str(v)})
+    elif isinstance(val, (list, tuple)):
+        for it in val:
+            if isinstance(it, dict):
+                out.append({
+                    "code": str(it.get("code", "") or it.get("код", "") or ""),
+                    "reason": str(it.get("reason", "") or it.get("обоснование", "") or "")
+                })
+            else:
+                out.append({"code": str(it), "reason": ""})
+    elif val:
+        out.append({"code": str(val), "reason": ""})
+    return out
+
+def _normalize_payments(val, fallback_duty: str, fallback_vat: str):
+    d = {"duty": fallback_duty, "vat": fallback_vat, "excise": "—", "fees": "—"}
+    if isinstance(val, dict):
+        for k in ("duty", "vat", "excise", "fees"):
+            if k in val and val[k] is not None:
+                d[k] = str(val[k]).strip()
+    return d
+
+def save_feedback_to_db(fb: FeedbackIn, request: Request) -> None:
+    conn = get_conn()
+    if conn is None:
+        return
+
+    try:
+        with conn: 
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO feedback (
+                        acc_code_rating,
+                        tech31_rating,
+                        reason_rating,
+                        ui_rating,
+                        req_manufacturer,
+                        req_product,
+                        req_extra,
+                        res_code,
+                        res_tech31,
+                        res_decl31,
+                        comment,
+                        user_agent,
+                        client_ip
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        fb.acc_code,
+                        fb.desc_31,
+                        fb.reason_clarity,
+                        fb.ui,
+                        fb.manufacturer or "",
+                        fb.product or "",
+                        fb.extra or "",
+                        fb.code or "",
+                        fb.tech31 or "",
+                        fb.decl31 or "",
+                        fb.comment or "",
+                        request.headers.get("user-agent", ""),
+                        request.client.host if request.client else None,
+                    ),
+                )
+    finally:
+        conn.close()
+
+def _normalize_requirements(val):
+    if isinstance(val, (list, tuple)):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        import re as _re
+        items = [s.strip(" -•\t") for s in _re.split(r"[\n;]+", val) if s.strip()]
+        return items or [val.strip()]
+    if val:
+        return [str(val)]
+    return []
+
+@app.post("/tnved/detect", response_model=DetectOut)
+def detect(inp: DetectIn, request: Request):
+    full = (inp.product or "").strip()
+    if inp.extra and inp.extra.strip().lower() != "null":
+        full += f" ({inp.extra.strip()})"
+    if inp.manufacturer and inp.manufacturer.strip().lower() != "null":
+        full += f" — Производитель: {inp.manufacturer.strip()}"
+
+    if not full:
+        raise HTTPException(status_code=400, detail="Поля пустые")
+
+    system_msg = """Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и по подготовке текстов для графы 31 декларации на товары.
+    Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и по подготовке текстов для графы 31 декларации на товары.
+    Твоя задача: по краткому описанию товара определить наиболее вероятный 10-значный код ТН ВЭД ЕАЭС, указать ставки платежей и сформировать подробное техническое описание товара.
+    Если предоставленной информации недостаточно для уверенной классификации (нет назначения, материалов, электрических параметров, области применения и т.п.), ты должен сначала получить недостающие сведения через web-поиск по типовым описаниям схожих товаров и уже на основе найденного сформировать итоговое описание. Используй только общедоступные и типовые характеристики, не выдумывай конкретные модели и бренды, если их нет во входных данных. Делай оговорки: «по типовым техническим характеристикам для такого вида товара».
+    Результат верни строго в виде одного json-объекта
+    Структура JSON (поля на русском):
+    
+    {
+      "code": "10-значный код или \"UNKNOWN\"",
+      "duty": "проценты или \"UNKNOWN\"",
+      "vat": "проценты или \"UNKNOWN\"",
+      "tech31": "подробное структурированное техописание: 1) назначение; 2) конструкция и материалы; 3) основные технические/электрические параметры (если применимо); 4) условия эксплуатации; 5) комплектация. Объем не меньше 100 слов. Если часть данных взята из типовых открытых источников — так и укажи.",
+      "decl31": "готовая формулировка для графы 31 декларации на товары, краткая, без лишних пояснений, в одном абзаце, с указанием основных отличительных признаков и назначения. Без слов «примерно», «возможно», «как правило».",
+      "classification_reason": "обоснование выбора позиции ТН ВЭД (ОПИ, примечания к группе/товарной позиции, признаки товара). Если есть неопределенность — укажи диапазон возможных кодов и чего не хватает.",
+      "alternatives": [
+        {"code": "возможный_код", "reason": "в каких случаях применим"}
+      ],
+      "payments": {
+        "duty": "% или \"UNKNOWN\"",
+        "vat": "% или \"UNKNOWN\"",
+        "excise": "— или значение",
+        "fees": "— или значение"
+      },
+      "requirements": [
+        "ТР ЕАЭС, безопасность, лицензирование, сертификация — если применимо"
+      ]
+    }
+    
+    Требования:
+    - не добавляй никаких комментариев вне JSON;
+    - не меняй имена полей;
+    - если веб-поиск не дал точных параметров — пиши «по типовым характеристикам для данного вида товара».
+    
+    """
+    user_msg = (
+        "Определи 10-значный код ТН ВЭД для товара и верни результат СТРОГО в виде JSON.\n"
+        "Вход:\n"
+        f"{json.dumps({'Наименование': full}, ensure_ascii=False)}"
+    )
+
+    try:
+        client = gpt_client()
+        resp = client.responses.create(
+            model="gpt-5",
+            tools=[{"type": "web_search"}],
+            reasoning={"effort": "medium"},
+            input=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Ошибка GPT API: {e}")
+
+    text = (resp.output_text or "").strip()
+    data = _extract_json_block(text) or {}
+
+    code = (data.get("code") or "").strip()
+    if not _take_10digits(code):
+        guessed = _take_10digits(text)
+        code = guessed or (code if code.upper().startswith("UNKNOWN") else "")
+
+    duty = _norm_percent(data.get("duty") or "")
+    vat  = _norm_percent(data.get("vat") or "")
+
+    code = code or "UNKNOWN"
+    duty = duty or "UNKNOWN"
+    vat  = vat or "UNKNOWN"
+
+    tech31 = _stringify_tech31(data.get("tech31"))
+    alternatives = _normalize_alternatives(data.get("alternatives"))
+    payments = _normalize_payments(data.get("payments"), fallback_duty=duty, fallback_vat=vat)
+    requirements = _normalize_requirements(data.get("requirements"))
+    decl31 = (data.get("decl31") or "").strip()
+
+    out = DetectOut(
+        code=code,
+        duty=duty,
+        vat=vat,
+        raw=text,
+        description=(data.get("description") or ""),
+        tech31=tech31,
+        decl31=decl31,
+        classification_reason=(data.get("classification_reason") or ""),
+        alternatives=alternatives,
+        payments=payments,
+        requirements=requirements,
+    )
+    return out
+
+
+@app.post("/feedback")
+def feedback(fb: FeedbackIn, request: Request):
+    saved = False
+    error = None
+
+    try:
+        save_feedback_to_db(fb, request)
+        saved = True
+    except Exception as e:
+        error = str(e)
+        print(f"[feedback] DB error: {e}")
+
+    return {
+        "status": "ok",
+        "saved": saved,  
+        "error": error  
+    }
+
+@app.get("/")
+def root():
+    return {"status": "Проверка работоспособности"}
+
 ############### AUTH / USERS / PROFILE ###############
 
 class UserOut(BaseModel):
@@ -1902,6 +2406,8 @@ class DeclarationOut(BaseModel):
     id: int
     title: str
     created_at: datetime
+    attached_file_id: Optional[int] = None
+    file_name: Optional[str] = None
 
 class DeclarationCreateIn(BaseModel):
     title: str
@@ -1925,6 +2431,23 @@ class FileUploadResp(BaseModel):
 
 APP_TZ = ZoneInfo("Europe/Moscow") 
 
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return pwd_context.verify(password, password_hash)
+    except Exception:
+        return False
+
+def looks_like_hash(s: str) -> bool:
+    if not s:
+        return False
+    return s.startswith("$2a$") or s.startswith("$2b$") or s.startswith("$2y$")
+
 def _user_to_out(row: Dict[str, Any]) -> UserOut:
     return UserOut(
         id=row["id"],
@@ -1944,7 +2467,7 @@ def auth_register(body: UserRegisterIn):
         name=body.name,
         surname=body.surname,
         email=body.email,
-        password=body.password, 
+        password=hash_password(body.password),
     )
     user = get_user_by_id(user_id)
     return _user_to_out(user)
@@ -1952,9 +2475,27 @@ def auth_register(body: UserRegisterIn):
 @app.post("/auth/login", response_model=UserOut)
 def auth_login(body: UserLoginIn):
     user = get_user_by_email(body.email)
-    if not user or user.get("password") != body.password:
+    if not user:
         raise HTTPException(401, "Неверный email или пароль")
+
+    stored = (user.get("password") or "").strip()
+    ok = False
+
+    if looks_like_hash(stored):
+        ok = verify_password(body.password, stored)
+    else:
+        ok = (stored == body.password)
+        if ok:
+            try:
+                update_user(user["id"], password=hash_password(body.password))
+            except Exception:
+                pass
+
+    if not ok:
+        raise HTTPException(401, "Неверный email или пароль")
+
     return _user_to_out(user)
+
 
 @app.get("/users/{user_id}/profile", response_model=UserProfileIn)
 def get_profile(user_id: int):
@@ -3268,22 +3809,24 @@ def compute_g31(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
     tnved_list = _collect_tnved_list(all_data) or []
     primary_tnved = _select_primary_tnved(all_data)
 
-    invoice_goods = (all_data.get("invoice") or {}).get("Товары", []) or []
+    invoice = (all_data.get("invoice") or {})
+    invoice_goods = invoice.get("Товары", []) or []
     if not isinstance(invoice_goods, list):
         invoice_goods = []
 
     def _safe_str(x: Any) -> str:
         return "" if x in (None, "") else str(x).strip()
 
-    def _build_desc(good: Dict[str, Any]) -> str:
-        name = _safe_str(good.get("Наименование") or good.get("Описание"))
+    def _norm_code(x: Any) -> str:
+        return _safe_str(x).replace(" ", "")
 
+    def _build_desc_fallback(good: Dict[str, Any]) -> str:
+        name = _safe_str(good.get("Наименование") or good.get("Описание"))
         extra_parts: List[str] = []
         for key in ("Модель", "Артикул", "Характеристики", "Маркировка"):
             v = _safe_str(good.get(key))
             if v:
                 extra_parts.append(f"{key}: {v}")
-
         if extra_parts:
             return f"{name} — " + "; ".join(extra_parts) if name else "; ".join(extra_parts)
         return name
@@ -3292,9 +3835,42 @@ def compute_g31(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
     for g in invoice_goods:
         if not isinstance(g, dict):
             continue
-        code = _safe_str(g.get("Код ТНВЭД"))
+        code = _norm_code(g.get("Код ТНВЭД"))
         if code and code not in by_tnved:
             by_tnved[code] = g
+
+    groups_raw = invoice.get("_tnved_groups") or {}
+    if not isinstance(groups_raw, dict):
+        groups_raw = {}
+
+    group_desc_by_code: Dict[str, str] = {}
+    for k, v in groups_raw.items():
+        code = _norm_code(k)
+        if not code:
+            continue
+        desc = ""
+        if isinstance(v, dict):
+            desc = _safe_str(v.get("Описание группы") or v.get("group_desc") or v.get("groupDesc"))
+        else:
+            desc = _safe_str(v)
+        if desc:
+            group_desc_by_code[code] = desc
+
+    def _desc_for_code(code_any: Any) -> str:
+        code = _norm_code(code_any)
+        if not code:
+            return ""
+
+        gd = group_desc_by_code.get(code)
+        if gd:
+            return gd
+        good = by_tnved.get(code)
+        if isinstance(good, dict):
+            tech = _safe_str(good.get("Техническое описание"))
+            if tech:
+                return tech
+            return _build_desc_fallback(good)
+        return ""
 
     over_list = overrides.get("g31_1_list")
     if isinstance(over_list, (list, tuple)):
@@ -3308,15 +3884,12 @@ def compute_g31(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
         g31_1_list: List[str] = []
         if tnved_list:
             for code in tnved_list:
-                good = by_tnved.get(code)
-                if isinstance(good, dict):
-                    g31_1_list.append(_build_desc(good))
-                else:
-                    g31_1_list.append("")
+                g31_1_list.append(_desc_for_code(code))
         else:
             for g in invoice_goods:
-                if isinstance(g, dict):
-                    g31_1_list.append(_build_desc(g))
+                if not isinstance(g, dict):
+                    continue
+                g31_1_list.append(_desc_for_code(g.get("Код ТНВЭД")) or _build_desc_fallback(g))
 
     if "g31_1" in overrides:
         g31_1_scalar = _safe_str(overrides.get("g31_1"))
@@ -3330,7 +3903,7 @@ def compute_g31(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
         else:
             g31_1_scalar = g31_1_list[0] if g31_1_list else ""
 
-    good_primary = by_tnved.get(primary_tnved) if primary_tnved else None
+    good_primary = by_tnved.get(_norm_code(primary_tnved)) if primary_tnved else None
     if not isinstance(good_primary, dict) and invoice_goods:
         good_primary = invoice_goods[0] if isinstance(invoice_goods[0], dict) else None
     good_primary = good_primary or {}
@@ -3359,7 +3932,7 @@ def compute_g31(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
 
     return {
         "g31_1_list": g31_1_list,
-        # "g31_additional": overrides.get("g31_additional", ""),
+        # "g31_1": g31_1_scalar,
         # "qty_1": overrides.get("qty_1", default_qty_1),
         # "qty_2": overrides.get("qty_2", default_qty_2),
         # "g31_ois": overrides.get("g31_ois", default_g31_ois),
@@ -3846,6 +4419,107 @@ def compute_g46(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
         "g46_1_list": result,
     }
 
+# def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+#     from graph import get_currency, _to_decimal, get_any
+#     from parser_cbrf import cb_rate
+#     from decimal import Decimal
+
+#     def _d(val) -> Decimal:
+#         try:
+#             return _to_decimal(val)
+#         except Exception:
+#             return Decimal("0")
+#     over_goods = overrides.get("goods_by_tnved")
+#     tnved_filter = str(overrides.get("goods_tnved_filter") or "").strip()
+
+#     if isinstance(over_goods, dict) and over_goods:
+#         goods_by_tnved: Dict[str, List[Dict[str, Any]]] = over_goods
+#         if tnved_filter:
+#             filtered: Dict[str, List[Dict[str, Any]]] = {}
+#             for code, items in goods_by_tnved.items():
+#                 if code.startswith(tnved_filter):
+#                     filtered[code] = items
+#             goods_by_tnved = filtered
+
+#         return {"goods_by_tnved": goods_by_tnved}
+
+#     invoice = (
+#         all_data.get("invoice")
+#         or all_data.get("invoice_json")
+#         or all_data.get("invoice_parsed")
+#         or {}
+#     )
+
+#     goods_src = None
+#     if isinstance(invoice, dict):
+#         goods_src = (
+#             invoice.get("Товары")
+#             or invoice.get("goods")
+#             or invoice.get("items")
+#         )
+
+#     if not isinstance(goods_src, list):
+#         return {"goods_by_tnved": {}}
+
+#     goods_by_tnved: Dict[str, List[Dict[str, Any]]] = {}
+
+#     for idx, g in enumerate(goods_src):
+#         if not isinstance(g, dict):
+#             continue
+
+#         code = str(g.get("Код ТНВЭД") or "").strip()
+#         if not code:
+#             continue
+
+#         name = g.get("Наименование") or ""
+#         manufacturer = (invoice.get("Отправитель").get("Название компании") or "")
+#         trademark = (g.get("Товарный знак") or "")
+#         goods_mark = g.get("Марка") or "ОТСУТСТВУЕТ"
+#         goods_model = g.get("Модель") or "ОТСУТСТВУЕТ"
+#         goods_marking = g.get("Артикул") or "ОТСУТСТВУЕТ"
+
+#         qty = g.get("Количество") or ""
+
+#         currency = g.get("Валюта") or ""
+#         if currency == "null":
+#             currency = ""
+
+#         price = _d(g.get("Цена"))
+#         qty_dec = _d(qty)
+#         invoiced_cost = _d(g.get("Стоимость"))
+
+#         if invoiced_cost <= 0:
+#             invoiced_cost = price * qty_dec
+
+
+#         item = {
+#             "index": idx,
+#             "tnved": code,
+#             "name": name,
+#             "manufacturer": manufacturer,
+#             "goods_trademark": trademark,
+#             "goods_mark": goods_mark,
+#             "goods_model": goods_model,
+#             "goods_marking": goods_marking,
+#             "qty": str(qty),
+#             "currency": currency,
+#             "invoiced_cost": str(invoiced_cost) if invoiced_cost != 0 else "",
+#         }
+
+#         goods_by_tnved.setdefault(code, []).append(item)
+
+#     tnved_filter = str(overrides.get("goods_tnved_filter") or "").strip()
+#     if tnved_filter:
+#         filtered: Dict[str, List[Dict[str, Any]]] = {}
+#         for code, items in goods_by_tnved.items():
+#             if code.startswith(tnved_filter):
+#                 filtered[code] = items
+#         goods_by_tnved = filtered
+
+#     return {
+#         "goods_by_tnved": goods_by_tnved,
+#     }
+
 def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     from graph import get_currency, _to_decimal, get_any
     from parser_cbrf import cb_rate
@@ -3856,6 +4530,7 @@ def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[s
             return _to_decimal(val)
         except Exception:
             return Decimal("0")
+
     over_goods = overrides.get("goods_by_tnved")
     tnved_filter = str(overrides.get("goods_tnved_filter") or "").strip()
 
@@ -3864,10 +4539,9 @@ def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[s
         if tnved_filter:
             filtered: Dict[str, List[Dict[str, Any]]] = {}
             for code, items in goods_by_tnved.items():
-                if code.startswith(tnved_filter):
-                    filtered[code] = items
+                if str(code).startswith(tnved_filter):
+                    filtered[str(code)] = items
             goods_by_tnved = filtered
-
         return {"goods_by_tnved": goods_by_tnved}
 
     invoice = (
@@ -3879,14 +4553,15 @@ def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[s
 
     goods_src = None
     if isinstance(invoice, dict):
-        goods_src = (
-            invoice.get("Товары")
-            or invoice.get("goods")
-            or invoice.get("items")
-        )
+        goods_src = invoice.get("Товары") or invoice.get("goods") or invoice.get("items")
 
     if not isinstance(goods_src, list):
         return {"goods_by_tnved": {}}
+
+    sender = invoice.get("Отправитель") if isinstance(invoice, dict) else None
+    if not isinstance(sender, dict):
+        sender = {}
+    manufacturer_default = (sender.get("Название компании") or "").strip()
 
     goods_by_tnved: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -3898,32 +4573,33 @@ def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[s
         if not code:
             continue
 
-        name = g.get("Наименование") or ""
-        manufacturer = (invoice.get("Отправитель").get("Название компании") or "")
-        trademark = (g.get("Товарный знак") or "")
-        goods_mark = g.get("Марка") or "ОТСУТСТВУЕТ"
-        goods_model = g.get("Модель") or "ОТСУТСТВУЕТ"
-        goods_marking = g.get("Артикул") or "ОТСУТСТВУЕТ"
+        original_name = str(g.get("Наименование") or "").strip()
+        tech_desc = str(g.get("Техническое описание") or "").strip()
+        display_name = tech_desc or original_name
+
+        trademark = str(g.get("Товарный знак") or "").strip()
+        goods_mark = str(g.get("Марка") or "").strip() or "ОТСУТСТВУЕТ"
+        goods_model = str(g.get("Модель") or "").strip() or "ОТСУТСТВУЕТ"
+        goods_marking = str(g.get("Артикул") or "").strip() or "ОТСУТСТВУЕТ"
 
         qty = g.get("Количество") or ""
-
-        currency = g.get("Валюта") or ""
-        if currency == "null":
+        currency = str(g.get("Валюта") or "").strip()
+        if currency.lower() == "null":
             currency = ""
 
         price = _d(g.get("Цена"))
         qty_dec = _d(qty)
         invoiced_cost = _d(g.get("Стоимость"))
-
         if invoiced_cost <= 0:
             invoiced_cost = price * qty_dec
-
 
         item = {
             "index": idx,
             "tnved": code,
-            "name": name,
-            "manufacturer": manufacturer,
+            "name": display_name,
+            "original_name": original_name,
+            "tech_desc": tech_desc,
+            "manufacturer": manufacturer_default,
             "goods_trademark": trademark,
             "goods_mark": goods_mark,
             "goods_model": goods_model,
@@ -3935,17 +4611,15 @@ def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[s
 
         goods_by_tnved.setdefault(code, []).append(item)
 
-    tnved_filter = str(overrides.get("goods_tnved_filter") or "").strip()
     if tnved_filter:
         filtered: Dict[str, List[Dict[str, Any]]] = {}
         for code, items in goods_by_tnved.items():
-            if code.startswith(tnved_filter):
+            if str(code).startswith(tnved_filter):
                 filtered[code] = items
         goods_by_tnved = filtered
 
-    return {
-        "goods_by_tnved": goods_by_tnved,
-    }
+    return {"goods_by_tnved": goods_by_tnved}
+
 
 def compute_graphs(all_data: Dict[str, Any],overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
@@ -4184,23 +4858,37 @@ def fill_ESADout_CU_with_gt(payload: Dict[str, Any]) -> ESADout_CU:
         customs_country_code="643"
     )
 
-    transport_means_1 = RUTransportMeans(
-        transport_identifier=payload.get("g18_2", ""),
-        transport_means_nationality_code=payload.get("g18_3", ""),
-        #active_transport_identifier="B072HM138",
-    )
+    raw_ids = str(payload.get("g18_2") or payload.get("g21_2") or "").upper()
+    country_code = str(payload.get("g18_3") or payload.get("g21_3") or "").upper()
+    parts = [p.strip() for p in re.split(r"[;/,]+", raw_ids) if p.strip()]
 
-    transport_means_2 = RUTransportMeans(
-        transport_identifier="",
-        transport_means_nationality_code=payload.get("g18_3", ""),
-        #active_transport_identifier="B072HM138",
+    ru_transport_means = []
+
+    for ident in parts:
+        ru_transport_means.append(
+            RUTransportMeans(
+                transport_identifier=ident,
+                transport_means_nationality_code=country_code,
+            )
+        )
+
+    if not ru_transport_means and country_code:
+        ru_transport_means.append(
+            RUTransportMeans(
+                transport_identifier="",
+                transport_means_nationality_code=country_code,
+            )
+        )
+    transport_means_qty = (
+        payload.get("g18_1")
+        or payload.get("g21_1")
+        or (str(len(ru_transport_means)) if ru_transport_means else "")
     )
 
     departure_transport = ESADout_CUDepartureArrivalTransport(
-        transport_mode_code=payload.get("g25_1", ""), 
-        transport_nationality_code=payload.get("g18_3", ""),
-        transport_means_quantity=payload.get("g18_1", ""),
-        ru_transport_means=[transport_means_1, transport_means_2],
+        transport_mode_code=payload.get("g25_1", ""),   
+        transport_means_quantity=transport_means_qty,
+        ru_transport_means=ru_transport_means,
     )
 
     border_transport = ESADout_CUBorderTransport(
@@ -4230,9 +4918,9 @@ def fill_ESADout_CU_with_gt(payload: Dict[str, Any]) -> ESADout_CU:
 
     goods_location = ESADout_CUGoodsLocation(
         information_type_code=payload.get("g30_1", ""),           
-        customs_office=payload.get("g30_2", ""),                   
+        customs_office=payload.get("g30_3", ""),                   
         customs_country_code=payload.get("g30_country_code", "RU"),
-        location_name="",                                         
+        location_name=payload.get("g30_svh_name", ""),                                         
         register_document_id_details=RegisterDocumentIdDetails(
             doc_id=payload.get("g30_license_number", "")
         ),
@@ -4367,8 +5055,8 @@ def fill_ESADout_CU_with_gt(payload: Dict[str, Any]) -> ESADout_CU:
         goods_list.append(goods)
 
     goods_shipment = ESADout_CUGoodsShipment(
-        origin_country_name=payload.get("g15_2", ""),
-        origin_country_code=payload.get("g15_1", ""),
+        origin_country_name=payload.get("g16_2", ""),
+        origin_country_code=payload.get("g16_1", ""),
         total_goods_number=str(n),
         total_package_number=str(payload.get("g6_1", "") or ""),
         total_sheet_number=str(n),
@@ -4422,8 +5110,6 @@ def api_get_declaration_xml(decl_id: int):
         graphs["document_id"] = f"declaration_{str(decl_id)}"
         payload = _payload_from_graphs(graphs)
         esad = fill_ESADout_CU_with_gt(payload)
-        from lxml import etree
-
         xml_elem = esad.to_xml()
         xml_bytes = etree.tostring(
             xml_elem,
