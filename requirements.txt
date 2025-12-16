@@ -18,3 +18,4 @@ pdfminer.six
 google-generativeai
 python-docx
 psycopg2-binary
+passlib[bcrypt]
