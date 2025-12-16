@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from datetime import datetime
 
 PG_DB        = os.getenv("PG_DB", "alldata")
-PG_HOST      = os.getenv("PG_HOST", "127.0.0.1")
+PG_HOST      = os.getenv("PG_HOST", "localhost")
 PG_PORT      = os.getenv("PG_PORT", "5432")
 PG_USER      = os.getenv("PG_USER", "postgres")
 PG_PASSWORD  = os.getenv("PG_PASSWORD", "1234")
@@ -614,7 +614,6 @@ def save_overrides(decl_id: int, overrides: Dict[str, Any]) -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(q, (json.dumps(overrides, ensure_ascii=False), decl_id))
         conn.commit()
-
 
 
 
