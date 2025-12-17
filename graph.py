@@ -935,7 +935,7 @@ def get_all_docx(data: dict, g25_1: str) -> Dict[str, List[str]]:
     }
 
     default_name_by_mode = {
-        "03011": "ДОГОВОР МЕЖДУНАРОДНОГО ДИСТРИБЬЮТЕРА",
+        "03011": "ДОГОВОР (КОНТРАКТ)",
         "04021": "СЧЕТ-ФАКТУРА (ИНВОЙС) К ДОГОВОРУ",
         "02015": "ТРАНСПОРТНАЯ НАКЛАДНАЯ (CMR)",
         "02017": "АВИАНАКЛАДНАЯ",
@@ -958,7 +958,7 @@ def get_all_docx(data: dict, g25_1: str) -> Dict[str, List[str]]:
 
     def clean_number(num: Any) -> str:
         if _is_empty(num):
-            return ""
+            return "БН"
         text = str(num).strip()
         matches = re.findall(r"[A-Za-zА-Яа-яЁё0-9/-]+", text)
         for m in matches:
@@ -1096,5 +1096,3 @@ def get_all_docx(data: dict, g25_1: str) -> Dict[str, List[str]]:
         add_doc(t_code, t_num, t_dt, t_nm)
 
     return out
-
-
