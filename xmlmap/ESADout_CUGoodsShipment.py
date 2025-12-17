@@ -696,15 +696,15 @@ class DocumentPresentingDetails(IXMLElement):
         self.customs_doc_id_details = customs_doc_id_details
     
     def to_xml(self) -> ET.Element:
-        elem = ET.Element('{urn:customs.ru:RUSCommonAggregateTypes:5.24.0}DocumentPresentingDetails')
+        elem = ET.Element('{urn:customs.ru:RUDeclCommonAggregateTypesCust:5.24.0}DocumentPresentingDetails')
         
         if self.doc_present_kind_code:
-            kind_elem = ET.Element('{urn:customs.ru:RUSCommonAggregateTypes:5.24.0}DocPresentKindCode')
+            kind_elem = ET.Element('{urn:customs.ru:RUDeclCommonAggregateTypesCust:5.24.0}DocPresentKindCode')
             kind_elem.text = self.doc_present_kind_code
             elem.append(kind_elem)
         
         if self.presented_document_mode_code:
-            mode_elem = ET.Element('{urn:customs.ru:RUSCommonAggregateTypes:5.24.0}PresentedDocumentModeCode')
+            mode_elem = ET.Element('{urn:customs.ru:RUDeclCommonAggregateTypesCust:5.24.0}PresentedDocumentModeCode')
             mode_elem.text = self.presented_document_mode_code
             elem.append(mode_elem)
         
