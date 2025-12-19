@@ -1,6 +1,6 @@
 ################## ИМПОРТЫ ##################
 import os, time, traceback, json, threading, re, httpx, openai, io
-from passlib.context import CryptContext
+#from passlib.context import CryptContext
 from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
 from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Query, Body, Request
@@ -2426,21 +2426,21 @@ class FileUploadResp(BaseModel):
 APP_TZ = ZoneInfo("Europe/Moscow") 
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+# def hash_password(password: str) -> str:
+#     return pwd_context.hash(password)
 
-def verify_password(password: str, password_hash: str) -> bool:
-    try:
-        return pwd_context.verify(password, password_hash)
-    except Exception:
-        return False
+# def verify_password(password: str, password_hash: str) -> bool:
+#     try:
+#         return pwd_context.verify(password, password_hash)
+#     except Exception:
+#         return False
 
-def looks_like_hash(s: str) -> bool:
-    if not s:
-        return False
-    return s.startswith("$2a$") or s.startswith("$2b$") or s.startswith("$2y$")
+# def looks_like_hash(s: str) -> bool:
+#     if not s:
+#         return False
+#     return s.startswith("$2a$") or s.startswith("$2b$") or s.startswith("$2y$")
 
 def _user_to_out(row: Dict[str, Any]) -> UserOut:
     return UserOut(
@@ -2461,33 +2461,41 @@ def auth_register(body: UserRegisterIn):
         name=body.name,
         surname=body.surname,
         email=body.email,
-        password=hash_password(body.password),
+        #password=hash_password(body.password),
+        password=(body.password or "").strip(),
     )
     user = get_user_by_id(user_id)
     return _user_to_out(user)
 
+# @app.post("/auth/login", response_model=UserOut)
+# def auth_login(body: UserLoginIn):
+#     user = get_user_by_email(body.email)
+#     if not user:
+#         raise HTTPException(401, "Неверный email или пароль")
+
+#     stored = (user.get("password") or "").strip()
+#     ok = False
+
+#     if looks_like_hash(stored):
+#         ok = verify_password(body.password, stored)
+#     else:
+#         ok = (stored == body.password)
+#         if ok:
+#             try:
+#                 update_user(user["id"], password=hash_password(body.password))
+#             except Exception:
+#                 pass
+
+#     if not ok:
+#         raise HTTPException(401, "Неверный email или пароль")
+
+#     return _user_to_out(user)
+
 @app.post("/auth/login", response_model=UserOut)
 def auth_login(body: UserLoginIn):
     user = get_user_by_email(body.email)
-    if not user:
+    if not user or user.get("password") != body.password:
         raise HTTPException(401, "Неверный email или пароль")
-
-    stored = (user.get("password") or "").strip()
-    ok = False
-
-    if looks_like_hash(stored):
-        ok = verify_password(body.password, stored)
-    else:
-        ok = (stored == body.password)
-        if ok:
-            try:
-                update_user(user["id"], password=hash_password(body.password))
-            except Exception:
-                pass
-
-    if not ok:
-        raise HTTPException(401, "Неверный email или пароль")
-
     return _user_to_out(user)
 
 
