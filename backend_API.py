@@ -1,11 +1,12 @@
 ################## ИМПОРТЫ ##################
 import os, time, traceback, json, threading, re, httpx, openai, io
-#from passlib.context import CryptContext
+from passlib.context import CryptContext
 from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
 from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, PlainTextResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from datetime import date
 from pydantic import BaseModel, EmailStr
 from contextlib import asynccontextmanager
@@ -44,9 +45,9 @@ from db import (
 )
 
 from yandex_ocr import extract_text_with_meta
-
+from openpyxl import load_workbook
 from graph import extract_index 
-
+import fitz
 from lxml import etree
 from docx import Document
 
@@ -107,6 +108,11 @@ YANDEX_CLOUD_MODEL = os.getenv("YANDEX_CLOUD_MODEL")
 OFDATA_API_KEY = os.getenv("OFDATA_API_KEY")  
 OFDATA_URL = "https://api.ofdata.ru/v2/company"
 
+def pdf_page_count(data: bytes) -> int:
+    doc = fitz.open(stream=data, filetype="pdf")
+    n = doc.page_count
+    doc.close()
+    return n
 
 def gpt_client():
     return openai_client()
@@ -1651,6 +1657,55 @@ def extract_docx_text_with_meta(file_bytes: bytes, filename: str = "") -> tuple[
     }
     return text, meta
 
+
+def extract_xlsx_text_with_meta(file_bytes: bytes, filename: str = "") -> tuple[str, dict]:
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+
+    parts: list[str] = []
+    sheets_used = 0
+    cells_used = 0
+
+    for ws in wb.worksheets:
+        sheets_used += 1
+        parts.append(f"--- SHEET: {ws.title} ---")
+
+        max_r = ws.max_row or 0
+        max_c = ws.max_column or 0
+
+        for r in range(1, max_r + 1):
+            row_vals: list[str] = []
+            empty_row = True
+
+            for c in range(1, max_c + 1):
+                v = ws.cell(row=r, column=c).value
+                if v is None:
+                    row_vals.append("")
+                    continue
+                s = str(v).strip()
+                if s:
+                    empty_row = False
+                row_vals.append(s)
+                cells_used += 1
+
+            if not empty_row:
+                line = " | ".join([x for x in row_vals if x != ""])
+                if line:
+                    parts.append(line)
+
+        parts.append("")
+
+    text = "\n".join(parts).strip()
+
+    meta = {
+        "engine": "openpyxl",
+        "filename": filename,
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "chars": len(text),
+        "sheets_used": sheets_used,
+        "cells_used": cells_used,
+    }
+    return text, meta
+
 def call_yandexgpt(file_bytes: bytes, filename: str, doc_key: str, mime: Optional[str] = None) -> Optional[Dict[str, Any]]:
 
     client = yandex_client()
@@ -1665,8 +1720,19 @@ def call_yandexgpt(file_bytes: bytes, filename: str, doc_key: str, mime: Optiona
         or "wordprocessingml" in mime  
     )
 
+    is_xlsx = (
+        fn_lower.endswith(".xlsx")
+        or "spreadsheetml" in mime
+        or mime in {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        }
+    )
+
     if is_docx:
         plain_text, ocr_meta = extract_docx_text_with_meta(file_bytes, filename)
+    elif is_xlsx:
+        plain_text, ocr_meta = extract_xlsx_text_with_meta(file_bytes, filename)
     else:
         plain_text, ocr_meta = extract_text_with_meta(
             file_bytes,
@@ -1780,6 +1846,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return PlainTextResponse(
+        content=str(exc.detail),
+        status_code=exc.status_code,
+    )
+
 @app.post("/v1/jobs", response_model=EnqueueResp)
 def enqueue_job(body: EnqueueBody):
     jid = jobs_create(body.decl_id, body.file_id, body.doc_key)
@@ -1796,6 +1869,21 @@ def job_status(job_id: int):
         error=row.get("error_text"),
         result=row.get("result_json")
     )
+
+@app.post("/debug/ocr")
+async def debug_ocr(file: UploadFile = File(...)):
+    file_bytes = await file.read()
+    text, meta = extract_text_with_meta(
+        file_bytes=file_bytes,
+        mime=file.content_type or ""
+    )
+
+    return {
+        "meta": meta,
+        "text_preview": text[:4000], 
+        "text_length": len(text or ""),
+    }
+
 
 @app.get("/v1/declarations/{decl_id}/jobs")
 def jobs_by_decl(decl_id: int):
@@ -1974,6 +2062,7 @@ def worker_loop():
 
         except Exception:
             jobs_finish_err(jid, traceback.format_exc())
+
 
 
 
@@ -2188,44 +2277,50 @@ def _normalize_payments(val, fallback_duty: str, fallback_vat: str):
     return d
 
 def save_feedback_to_db(fb: FeedbackIn, request: Request) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO feedback (
-                    acc_code_rating,
-                    tech31_rating,
-                    reason_rating,
-                    ui_rating,
-                    req_manufacturer,
-                    req_product,
-                    req_extra,
-                    res_code,
-                    res_tech31,
-                    res_decl31,
-                    comment,
-                    user_agent,
-                    client_ip
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    fb.acc_code,
-                    fb.desc_31,
-                    fb.reason_clarity,
-                    fb.ui,
-                    fb.manufacturer or "",
-                    fb.product or "",
-                    fb.extra or "",
-                    fb.code or "",
-                    fb.tech31 or "",
-                    fb.decl31 or "",
-                    fb.comment or "",
-                    request.headers.get("user-agent", ""),
-                    request.client.host if request.client else None,
-                ),
-            )
+    conn = get_conn()
+    if conn is None:
+        return
 
+    try:
+        with conn: 
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO feedback (
+                        acc_code_rating,
+                        tech31_rating,
+                        reason_rating,
+                        ui_rating,
+                        req_manufacturer,
+                        req_product,
+                        req_extra,
+                        res_code,
+                        res_tech31,
+                        res_decl31,
+                        comment,
+                        user_agent,
+                        client_ip
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        fb.acc_code,
+                        fb.desc_31,
+                        fb.reason_clarity,
+                        fb.ui,
+                        fb.manufacturer or "",
+                        fb.product or "",
+                        fb.extra or "",
+                        fb.code or "",
+                        fb.tech31 or "",
+                        fb.decl31 or "",
+                        fb.comment or "",
+                        request.headers.get("user-agent", ""),
+                        request.client.host if request.client else None,
+                    ),
+                )
+    finally:
+        conn.close()
 
 def _normalize_requirements(val):
     if isinstance(val, (list, tuple)):
@@ -2426,21 +2521,21 @@ class FileUploadResp(BaseModel):
 APP_TZ = ZoneInfo("Europe/Moscow") 
 
 
-# pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# def hash_password(password: str) -> str:
-#     return pwd_context.hash(password)
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-# def verify_password(password: str, password_hash: str) -> bool:
-#     try:
-#         return pwd_context.verify(password, password_hash)
-#     except Exception:
-#         return False
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return pwd_context.verify(password, password_hash)
+    except Exception:
+        return False
 
-# def looks_like_hash(s: str) -> bool:
-#     if not s:
-#         return False
-#     return s.startswith("$2a$") or s.startswith("$2b$") or s.startswith("$2y$")
+def looks_like_hash(s: str) -> bool:
+    if not s:
+        return False
+    return s.startswith("$2a$") or s.startswith("$2b$") or s.startswith("$2y$")
 
 def _user_to_out(row: Dict[str, Any]) -> UserOut:
     return UserOut(
@@ -2461,41 +2556,33 @@ def auth_register(body: UserRegisterIn):
         name=body.name,
         surname=body.surname,
         email=body.email,
-        #password=hash_password(body.password),
-        password=(body.password or "").strip(),
+        password=hash_password(body.password),
     )
     user = get_user_by_id(user_id)
     return _user_to_out(user)
 
-# @app.post("/auth/login", response_model=UserOut)
-# def auth_login(body: UserLoginIn):
-#     user = get_user_by_email(body.email)
-#     if not user:
-#         raise HTTPException(401, "Неверный email или пароль")
-
-#     stored = (user.get("password") or "").strip()
-#     ok = False
-
-#     if looks_like_hash(stored):
-#         ok = verify_password(body.password, stored)
-#     else:
-#         ok = (stored == body.password)
-#         if ok:
-#             try:
-#                 update_user(user["id"], password=hash_password(body.password))
-#             except Exception:
-#                 pass
-
-#     if not ok:
-#         raise HTTPException(401, "Неверный email или пароль")
-
-#     return _user_to_out(user)
-
 @app.post("/auth/login", response_model=UserOut)
 def auth_login(body: UserLoginIn):
     user = get_user_by_email(body.email)
-    if not user or user.get("password") != body.password:
+    if not user:
         raise HTTPException(401, "Неверный email или пароль")
+
+    stored = (user.get("password") or "").strip()
+    ok = False
+
+    if looks_like_hash(stored):
+        ok = verify_password(body.password, stored)
+    else:
+        ok = (stored == body.password)
+        if ok:
+            try:
+                update_user(user["id"], password=hash_password(body.password))
+            except Exception:
+                pass
+
+    if not ok:
+        raise HTTPException(401, "Неверный email или пароль")
+
     return _user_to_out(user)
 
 
@@ -2571,6 +2658,26 @@ def api_list_decl_files(decl_id: int):
 @app.post("/declarations/{decl_id}/files", response_model=FileUploadResp)
 async def api_upload_decl_file(decl_id: int,user_id: int = Form(...),doc_key: str = Form(...),file: UploadFile = File(...),):
     data = await file.read()
+    pages = 0
+    mime = file.content_type or ""
+
+    if mime == "application/pdf":
+        try:
+            pages = pdf_page_count(data)
+        except Exception:
+            pages = 0
+
+    MAX_PDF_PAGES = 3
+
+    if pages > MAX_PDF_PAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"PDF содержит {pages} страниц. "
+                f"Допустимо не более {MAX_PDF_PAGES} страниц для автоматического OCR. "
+                f"Разбейте документ на части по ссылке ниже:"
+            )
+        )
     mime = file.content_type or "application/octet-stream"
     file_id = add_file(user_id, file.filename, mime, data)
     link_file_to_declaration(decl_id, file_id, doc_key, replace=False)
@@ -3950,19 +4057,21 @@ def compute_g32(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
     }
 
 def compute_g33(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
-    tnved_list = _collect_tnved_list(all_data)
-    tnved_list_over = overrides.get("g33_list")
+    tnved_list = _collect_tnved_list(all_data) or []
+    tnved_list_over = overrides.get("g33_1_list")
+
+    if not isinstance(tnved_list_over, (list, tuple)):
+        tnved_list_over = overrides.get("g33_list")
+
     if isinstance(tnved_list_over, (list, tuple)):
         cleaned = []
         for x in tnved_list_over:
-            s = str(x).strip()
+            s = "" if x in (None, "") else str(x).strip()
             if s:
                 cleaned.append(s)
         tnved_list = cleaned
 
-    return {
-        "g33_1_list": tnved_list,
-    }
+    return {"g33_1_list": tnved_list}
 
 def compute_g34(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     from graph import get_product_country, normalize_country, get_country_code
@@ -4009,25 +4118,34 @@ def compute_g34(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
 
 def compute_g35(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     from graph import get_brutto
+
     tnved_list = _collect_tnved_list(all_data) or []
+    target_len = len(tnved_list) or 1
 
     try:
         brutto_map = get_brutto(all_data) or {}
     except Exception:
         brutto_map = {}
 
-    over_list = overrides.get("g35_list")
+    over_list = overrides.get("g35_1_list")
+    if not isinstance(over_list, (list, tuple)):
+        over_list = overrides.get("g35_list")
+
     if isinstance(over_list, (list, tuple)):
-        g35_list = [str(x).strip() for x in over_list]
+        g35_list = [("" if v in (None, "") else str(v).strip()) for v in over_list]
     else:
         g35_list = []
         for code in tnved_list:
             val = brutto_map.get(code)
             g35_list.append("" if val in (None, "") else str(val))
 
-    return {
-        "g35_1_list": g35_list,
-    }
+    if len(g35_list) < target_len:
+        g35_list += [""] * (target_len - len(g35_list))
+    elif len(g35_list) > target_len:
+        g35_list = g35_list[:target_len]
+
+    return {"g35_1_list": g35_list}
+
 
 def compute_g36(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     default_g36_1 = "ОО"
@@ -4074,25 +4192,33 @@ def compute_g37(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
 
 def compute_g38(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     from graph import get_netto
+
     tnved_list = _collect_tnved_list(all_data) or []
+    target_len = len(tnved_list) or 1
 
     try:
         netto_map = get_netto(all_data) or {}
     except Exception:
         netto_map = {}
 
-    over_list = overrides.get("g38_list")
+    over_list = overrides.get("g38_1_list")
+    if not isinstance(over_list, (list, tuple)):
+        over_list = overrides.get("g38_list")
+
     if isinstance(over_list, (list, tuple)):
-        g38_list = [str(x).strip() for x in over_list]
+        g38_list = [("" if v in (None, "") else str(v).strip()) for v in over_list]
     else:
         g38_list = []
         for code in tnved_list:
             val = netto_map.get(code)
             g38_list.append("" if val in (None, "") else str(val))
 
-    return {
-        "g38_1_list": g38_list,
-    }
+    if len(g38_list) < target_len:
+        g38_list += [""] * (target_len - len(g38_list))
+    elif len(g38_list) > target_len:
+        g38_list = g38_list[:target_len]
+
+    return {"g38_1_list": g38_list}
 
 def compute_g39(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     tnved_list = _collect_tnved_list(all_data)
@@ -4281,63 +4407,140 @@ def compute_g44(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
         "g44_5_list": parts.get("dates_iso", []) or []
     }
 
+# def compute_g45(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+#     from graph import get_brutto, get_brutto_sum, _to_decimal
+
+#     tnved_list = _collect_tnved_list(all_data) or []
+#     target_len = len(tnved_list)
+#     over_list = overrides.get("g45_1_list")
+#     if isinstance(over_list, (list, tuple)):
+#         vals = [("" if v in (None, "") else str(v).strip()) for v in over_list]
+#         if len(vals) < target_len:
+#             vals += [""] * (target_len - len(vals))
+#         elif len(vals) > target_len:
+#             vals = vals[:target_len]
+#         return {"g45_1_list": vals}
+
+#     g12_1_str = overrides.get("g12_1")
+#     if not g12_1_str:
+#         try:
+#             base12 = compute_g12(all_data, overrides) 
+#             g12_1_str = base12.get("g12_1") or ""
+#         except Exception:
+#             g12_1_str = ""
+
+#     total_value = _to_decimal(g12_1_str)
+#     if total_value <= Decimal("0"):
+#         return {"g45_1_list": [""] * target_len}
+
+#     try:
+#         brutto_map = get_brutto(all_data) or {}
+#     except Exception:
+#         brutto_map = {}
+
+#     try:
+#         total_brutto = get_brutto_sum(all_data)
+#     except Exception:
+#         total_brutto = 0.0
+
+#     total_brutto_dec = _to_decimal(total_brutto)
+#     if total_brutto_dec <= Decimal("0"):
+#         return {"g45_1_list": [""] * target_len}
+
+#     result: List[str] = []
+#     for code in tnved_list:
+#         item_brutto_dec = _to_decimal(brutto_map.get(code))
+#         if item_brutto_dec <= Decimal("0"):
+#             result.append("")
+#             continue
+#         try:
+#             item_value = (total_value * item_brutto_dec / total_brutto_dec).quantize(
+#                 Decimal("0.01")
+#             )
+#             result.append(str(item_value))
+#         except Exception:
+#             result.append("")
+
+#     return {
+#         "g45_1_list": result,
+#     }
+
 def compute_g45(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
-    from graph import get_brutto, get_brutto_sum, _to_decimal
+    from decimal import Decimal
+    from graph import _to_decimal
 
     tnved_list = _collect_tnved_list(all_data) or []
-    target_len = len(tnved_list)
+    target_len = len(tnved_list) or 1
+
+    def _norm_list(v, n: int) -> List[str]:
+        if isinstance(v, (list, tuple)):
+            lst = [("" if x in (None, "") else str(x).strip()) for x in v]
+        else:
+            lst = []
+        if len(lst) < n:
+            lst += [""] * (n - len(lst))
+        elif len(lst) > n:
+            lst = lst[:n]
+        return lst
+
     over_list = overrides.get("g45_1_list")
     if isinstance(over_list, (list, tuple)):
-        vals = [("" if v in (None, "") else str(v).strip()) for v in over_list]
-        if len(vals) < target_len:
-            vals += [""] * (target_len - len(vals))
-        elif len(vals) > target_len:
-            vals = vals[:target_len]
-        return {"g45_1_list": vals}
+        return {"g45_1_list": _norm_list(over_list, target_len)}
 
-    g12_1_str = overrides.get("g12_1")
-    if not g12_1_str:
+    if isinstance(overrides.get("g42_1_list"), (list, tuple)):
+        g42_list = _norm_list(overrides.get("g42_1_list"), target_len)
+    else:
         try:
-            base12 = compute_g12(all_data, overrides) 
-            g12_1_str = base12.get("g12_1") or ""
+            base42 = compute_g42(all_data, overrides)
+            g42_list = _norm_list(base42.get("g42_1_list"), target_len)
         except Exception:
-            g12_1_str = ""
+            g42_list = [""] * target_len
 
-    total_value = _to_decimal(g12_1_str)
-    if total_value <= Decimal("0"):
+    rate_str = overrides.get("g23_1")
+    if not rate_str:
+        try:
+            base23 = compute_g23(all_data, overrides)
+            rate_str = base23.get("g23_1") or ""
+        except Exception:
+            rate_str = ""
+    rate = _to_decimal(rate_str)
+    if rate <= Decimal("0"):
         return {"g45_1_list": [""] * target_len}
 
-    try:
-        brutto_map = get_brutto(all_data) or {}
-    except Exception:
-        brutto_map = {}
+    if overrides.get("g12_logistics") is not None or overrides.get("g12_insurance") is not None:
+        add_total = _to_decimal(overrides.get("g12_logistics")) + _to_decimal(overrides.get("g12_insurance"))
+    else:
+        try:
+            base12 = compute_g12(all_data, overrides)
+            add_total = _to_decimal(base12.get("g12_logistics")) + _to_decimal(base12.get("g12_insurance"))
+        except Exception:
+            add_total = Decimal("0")
+    add_total = add_total.quantize(Decimal("0.01")) if add_total != 0 else Decimal("0.00")
 
     try:
-        total_brutto = get_brutto_sum(all_data)
+        base35 = compute_g35(all_data, overrides)
+        g35_list = _norm_list(base35.get("g35_1_list"), target_len)
     except Exception:
-        total_brutto = 0.0
+        g35_list = [""] * target_len
 
-    total_brutto_dec = _to_decimal(total_brutto)
-    if total_brutto_dec <= Decimal("0"):
-        return {"g45_1_list": [""] * target_len}
+    brutto_dec = [_to_decimal(x) for x in g35_list]
+    total_brutto = sum([b for b in brutto_dec if b > 0], Decimal("0"))
 
     result: List[str] = []
-    for code in tnved_list:
-        item_brutto_dec = _to_decimal(brutto_map.get(code))
-        if item_brutto_dec <= Decimal("0"):
-            result.append("")
-            continue
-        try:
-            item_value = (total_value * item_brutto_dec / total_brutto_dec).quantize(
-                Decimal("0.01")
-            )
-            result.append(str(item_value))
-        except Exception:
-            result.append("")
+    for i in range(target_len):
+        inv_val = _to_decimal(g42_list[i])
+        base_rub = (inv_val * rate).quantize(Decimal("0.01")) if inv_val > 0 else Decimal("0.00")
 
-    return {
-        "g45_1_list": result,
-    }
+        share = Decimal("0.00")
+        if add_total > 0 and total_brutto > 0 and brutto_dec[i] > 0:
+            share = (add_total * brutto_dec[i] / total_brutto).quantize(Decimal("0.01"))
+
+        item_total = (base_rub + share).quantize(Decimal("0.01"))
+        result.append("" if item_total <= 0 else str(item_total))
+
+    return {"g45_1_list": result}
+
+
 
 def compute_g46(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     from parser_cbrf import cb_rate
