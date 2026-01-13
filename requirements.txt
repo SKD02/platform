@@ -19,3 +19,4 @@ google-generativeai
 python-docx
 psycopg2-binary
 passlib[bcrypt]
+openpyxl
