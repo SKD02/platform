@@ -2570,51 +2570,50 @@ def _normalize_payments(val, fallback_duty: str, fallback_vat: str):
     return d
 
 def save_feedback_to_db(fb: FeedbackIn, request: Request) -> None:
-    conn = get_conn()
-    if conn is None:
-        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            user_agent = request.headers.get("user-agent", "") or ""
+            client_ip = (request.client.host if request.client else "") or ""
 
-    try:
-        with conn: 
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO feedback (
-                        acc_code_rating,
-                        tech31_rating,
-                        reason_rating,
-                        ui_rating,
-                        req_manufacturer,
-                        req_product,
-                        req_extra,
-                        res_code,
-                        res_tech31,
-                        res_decl31,
-                        comment,
-                        user_agent,
-                        client_ip
-                    )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        fb.acc_code,
-                        fb.desc_31,
-                        fb.reason_clarity,
-                        fb.ui,
-                        fb.manufacturer or "",
-                        fb.product or "",
-                        fb.extra or "",
-                        fb.code or "",
-                        fb.tech31 or "",
-                        fb.decl31 or "",
-                        fb.comment or "",
-                        request.headers.get("user-agent", ""),
-                        request.client.host if request.client else None,
-                    ),
+            cur.execute(
+                """
+                INSERT INTO feedback (
+                    acc_code_rating,
+                    tech31_rating,
+                    reason_rating,
+                    ui_rating,
+                    req_manufacturer,
+                    req_product,
+                    req_extra,
+                    res_code,
+                    res_tech31,
+                    res_decl31,
+                    comment,
+                    user_agent,
+                    client_ip
                 )
-    finally:
-        conn.close()
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    fb.acc_code,
+                    fb.desc_31,
+                    fb.reason_clarity,
+                    fb.ui,
+                    fb.manufacturer or "",
+                    fb.product or "",
+                    fb.extra or "",
+                    fb.code or "",
+                    fb.tech31 or "",
+                    fb.decl31 or "",
+                    fb.comment or "",
+                    user_agent,
+                    client_ip,  
+                ),
+            )
 
+        conn.commit()  
+
+        
 def _normalize_requirements(val):
     if isinstance(val, (list, tuple)):
         return [str(x).strip() for x in val if str(x).strip()]
@@ -2802,21 +2801,20 @@ def detect(inp: DetectIn, request: Request, current=Depends(get_current_user)):
 
 @misc_router.post("/feedback", tags=["feedback"])
 def feedback(fb: FeedbackIn, request: Request):
-    saved = False
-    error = None
-
     try:
         save_feedback_to_db(fb, request)
-        saved = True
+        return {"status": "ok", "saved": True}
     except Exception as e:
-        error = str(e)
-        print(f"[feedback] DB error: {e}")
-
-    return {
-        "status": "ok",
-        "saved": saved,  
-        "error": error  
-    }
+        print(f"[feedback] DB error: {e!r}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "saved": False,
+                "error": "FEEDBACK_DB_ERROR",
+                "message": "Не удалось сохранить обратную связь",
+            },
+        )
 
 @misc_router.get("/")
 def root():
