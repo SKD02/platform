@@ -1,9 +1,8 @@
  ################## ИМПОРТЫ ##################
-import os, time, traceback, json, threading, re, httpx, openai, io
-#from passlib.context import CryptContext
+import os, time, traceback, json, threading, re, httpx,  io
 from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
-from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Query, Body, Request
+from fastapi import UploadFile, File, Form, FastAPI, APIRouter, HTTPException, Query, Body, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -25,8 +24,6 @@ from db import (
     get_user_by_id,
     create_user,
     update_user,
-    get_user_profile,
-    upsert_user_profile,
     add_declaration,
     list_declarations,
     update_declaration,
@@ -35,13 +32,31 @@ from db import (
     link_file_to_declaration,
     unlink_file_from_declaration,
     get_declaration_date,
-    get_declaration_datetime,
     get_overrides,
     save_overrides,
     get_declaration_invoice_json,
     save_declaration_invoice_json,
     get_declaration_user_id,
-    get_conn
+    get_conn,
+    list_active_tariff_plans,
+    get_tariff_plan_by_code,
+    payments_create_pending,
+    payments_set_provider_payment_id,
+    payments_get_by_id,
+    payments_get_by_id_and_user,
+    payments_update_status_by_provider_id,
+    credits_apply_purchase,
+    credits_get_balance,     
+    credits_get_status,
+    credits_consume,
+    consume_free_credits,
+    tnved_requests_add,
+    tnved_requests_list_by_user,
+    payments_list_by_user,
+    set_user_role,
+    set_user_block,
+    credits_ledger_list,
+    set_user_password_and_flag,
 )
 
 from yandex_ocr import extract_text_with_meta
@@ -50,6 +65,12 @@ from graph import extract_index
 import fitz
 from lxml import etree
 from docx import Document
+
+import logging
+from datetime import timedelta
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from collections import defaultdict, deque
 
 from xmlmap.ESADout_CU import (
     DocumentID as ESADout_CU_DocumentID,
@@ -84,7 +105,6 @@ from xmlmap.ESADout_CUGoodsShipment import (
     Preferencii,
     DocumentPresentingDetails,
     ESADout_CUPresentedDocument,
-    ESADout_CUCustomsPaymentCalculation,
     PackagePalleteInformation,
     ESADGoodsPackaging,
     ESADCustomsProcedure,
@@ -92,6 +112,11 @@ from xmlmap.ESADout_CUGoodsShipment import (
     ESADout_CUGoods,
 )
 
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
+import uuid
+import traceback
 
 
 
@@ -99,14 +124,42 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")  
 YANDEX_FOLDER  = os.getenv("YANDEX_FOLDER_ID")
-YANDEX_MODEL   = os.getenv("YANDEX_GPT_MODEL", "yandexgpt-lite/rc")
 
 YANDEX_CLOUD_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER")
-YANDEX_CLOUD_API_KEY = os.getenv("YANDEX_CLOUD_API_KEY")
 YANDEX_CLOUD_MODEL = os.getenv("YANDEX_CLOUD_MODEL")
 
 OFDATA_API_KEY = os.getenv("OFDATA_API_KEY")  
 OFDATA_URL = "https://api.ofdata.ru/v2/company"
+
+
+
+APP_ENV = os.getenv("APP_ENV", "dev").lower()  # dev|staging|prod
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
+ACCESS_TOKEN_EXPIRE_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MIN", "43200")) 
+
+
+_rl = defaultdict(deque)
+def rate_limit(key: str, limit: int, window_sec: int):
+    now = time.time()
+    q = _rl[key]
+    while q and (now - q[0] > window_sec):
+        q.popleft()
+    if len(q) > limit:
+        api_error(
+            429,
+            "RATE_LIMIT",
+            "Слишком много запросов",
+            hint="Подождите немного и попробуйте снова.",
+            details={"key": key, "limit": limit, "window_sec": window_sec},
+        )
+    q.append(now)
+
+def client_ip(request: Request) -> str:
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 def pdf_page_count(data: bytes) -> int:
     doc = fitz.open(stream=data, filetype="pdf")
@@ -157,7 +210,7 @@ def build_prompt(doc_key: str, filename: str, extracted_text: str) -> str:
     )
 
 
-# === JSON Schemas ===
+################## JSON Schemas ##################
 def json_schema_for(doc_key: str) -> dict:
     if doc_key == "invoice":
         return {
@@ -1188,16 +1241,15 @@ def json_schema_for(doc_key: str) -> dict:
         }
         }
 
-    # -------------------- fallback --------------------
     return {"name": "Generic", "schema": {"type": "object"}}
 
+######################################################
 def _take_10digits(s: str) -> str:
     if not s: return ""
     m = re.search(r"\b(\d{10})\b", s.replace(" ", ""))
     return m.group(1) if m else ""
 
 def _norm_percent(s: str) -> str:
-    """Нормализуем проценты: '5%' / '5 %' / '5,0%' -> '5%'."""
     if not s:
         return ""
     t = str(s).strip().replace(" ", "")
@@ -1210,134 +1262,6 @@ def _norm_percent(s: str) -> str:
         return ""
     val = float(m.group(1))
     return f"{int(val)}%" if abs(val - round(val)) < 1e-9 else f"{val}%"
-
-# def classify_tnved_gpt(items: list[dict]) -> list[dict]:
-#     names: list[str] = []
-#     name_map: list[str] = []  
-#     for it in items or []:
-#         name = (it.get("Наименование") or "").strip()
-#         extra = (it.get("Дополнительная информация") or "").strip()
-#         manufacture = (it.get("Производитель") or "").strip()
-#         full = name
-#         if extra and extra.lower() != "null":
-#             full += f" ({extra})"
-#         if manufacture and manufacture.lower() != "null":      
-#             full += f" — Производитель: {manufacture}" 
-#         if full:
-#             names.append(full)
-#             name_map.append(full)
-
-#     if not names:
-#         return [{"Наименование": (it.get("Наименование") or ""), "Код": ""} for it in (items or [])]
-
-#     payload = {"Товары": [{"Наименование": n} for n in names]}
-#     client = gpt_client()
-#     resp = client.responses.create(
-#         model="gpt-5",
-#         tools=[{"type": "web_search"}],
-#         reasoning={"effort": "medium"},
-#         input=[
-#             {"role": "system", "content": "Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и по подготовке текстов для графы 31 декларации на товары. Твоя задача: по краткому описанию товара определить наиболее вероятный 10-значный код ТН ВЭД ЕАЭС, указать ставки платежей и сформировать подробное техническое описание товара. Если предоставленной информации недостаточно для уверенной классификации (нет назначения, материалов, электрических параметров, области применения и т.п.), ты должен сначала получить недостающие сведения через web-поиск по типовым описаниям схожих товаров и уже на основе найденного сформировать итоговое описание. Используй только общедоступные и типовые характеристики, не выдумывай конкретные модели и бренды, если их нет во входных данных"},
-#             {"role": "user", "content":
-#                 "Определи 10-значные коды ТН ВЭД для следующих товаров (у каждого товара могут быть разные коды ТН ВЭД), размер пошлины(%) при импорте в РФ и размер НДС(%) и Готовую формулировку для 31 графы декларации (краткая, без лишних пояснений, с указанием основных отличительных признаков и назначения. Без слов «примерно», «возможно», «как правило»\n"
-#                 f"{json.dumps(payload, ensure_ascii=False)}\n"
-#                 " Верни в формате: \n <Наименование товара из входных данных> ; <Код ТНВЭД>; <Размер пошлины>; <Размер НДС>; <Техническое описание для 31 графы>\n"
-#                 " Если не уверен — всё равно выбери наилучший код.\n"
-#             },
-#         ]
-#     )
-#     text = (resp.output_text or "").strip()
-#     ans: dict[str, str] = {}
-#     for line in text.splitlines():
-#         parts = [p.strip() for p in line.split(";")]
-#         if len(parts) < 2:
-#             continue
-#         left = parts[0] 
-#         right_code = parts[1] if len(parts) >= 2 else ""
-#         duty_raw   = parts[2] if len(parts) >= 3 else ""
-#         vat_raw    = parts[3] if len(parts) >= 4 else ""
-#         decl31 = ";".join(parts[4:]).strip() if len(parts) >= 5 else ""
-
-
-#         code = _take_10digits(right_code)
-#         if not code:
-#             code = _take_10digits(line)
-
-#         duty = _norm_percent(duty_raw) or "0%"
-#         vat  = _norm_percent(vat_raw)  or "0%"
-#         ans[left.lower()] = {"Код": code, "Пошлина": duty, "НДС": vat, "Техническое описание": decl31}
-
-#     out: list[dict] = []
-#     for full in name_map:
-#         key = (full or "").lower()
-#         rec = None
-#         if key in ans:
-#             rec = ans[key]
-#         else:
-#             for k, v in ans.items():
-#                 if k in key or key in k:
-#                     rec = v
-#                     break
-#         if rec:
-#             out.append({"Наименование": full, "Код": rec["Код"], "Пошлина": rec["Пошлина"], "НДС": rec["НДС"], "Техническое описание": rec["Техническое описание"]})
-#         else:
-#             out.append({"Наименование": full, "Код": "", "Пошлина": "", "НДС": "", "Техническое описание": ""})
-#     return out
-
-# def enrich_tnved_if_invoice(parsed: dict, fail_soft: bool = True) -> dict:
-#     try:
-#         if not isinstance(parsed, dict):
-#             return parsed
-#         if parsed.get("_doc_key") not in {"invoice"}:
-#             return parsed
-
-#         goods = parsed.get("Товары")
-#         if not isinstance(goods, list) or not goods:
-#             return parsed
-        
-#         manufacturer = ""
-#         try:
-#             manufacturer = (parsed.get("invoice", {}).get("Отправитель", {}).get("Название компании") or "").strip()
-#         except Exception:
-#             manufacturer = ""
-
-#         items_for_api: list[dict] = []
-#         for it in goods:
-#             if not isinstance(it, dict):
-#                 continue
-#             name  = (it.get("Наименование") or "").strip()
-#             extra = (it.get("Дополнительная информация") or "").strip()
-#             items_for_api.append({"Наименование": name, "Дополнительная информация": extra, "Производитель": manufacturer})
-
-#         tnved_list = classify_tnved_gpt(items_for_api)
-
-#         changed = 0
-#         for i, it in enumerate(goods):
-#             if not isinstance(it, dict) or i >= len(tnved_list):
-#                 continue
-#             code = (tnved_list[i].get("Код")     or "").strip()
-#             duty = (tnved_list[i].get("Пошлина") or "").strip()
-#             vat  = (tnved_list[i].get("НДС")     or "").strip()
-#             decl31 = (tnved_list[i].get("Техническое описание") or "").strip()
-
-#             if code:
-#                 it["Код ТНВЭД"] = code; changed += 1
-#             if duty:
-#                 it["Пошлина"]   = duty
-#             if vat:
-#                 it["НДС"]       = vat
-#             if decl31:
-#                 it["Техническое описание"]   = decl31
-
-#         parsed["_tnved"] = {"status": "ok", "changed": changed, "mode": "overwrite"}
-#         return parsed
-
-#     except Exception as e:
-#         if fail_soft:
-#             parsed["_tnved"] = {"status": "error", "reason": str(e)}
-#             parsed["_tnved_gpt_error"] = str(e)
-#             return parsed
-#         raise RuntimeError(f"TNVED enrichment failed: {e}")
 
 def classify_tnved_gpt(items: list[dict]) -> dict:
     name_map: list[str] = []
@@ -1827,7 +1751,102 @@ async def lifespan(app: FastAPI):
     yield
     _stop.set()
 
-app = FastAPI(title="VED Declarant API", version="1.0", lifespan=lifespan)
+app = FastAPI(title="AI-Декларант API", version="1.0", lifespan=lifespan)
+
+
+class APIException(HTTPException):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        hint: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        payload = {
+            "code": code,
+            "message": message,
+            "hint": hint or "",
+            "details": details or {},
+        }
+        super().__init__(status_code=status_code, detail=payload, headers=headers)
+
+def api_error(
+    status: int,
+    code: str,
+    message: str,
+    hint: str = "",
+    details: Optional[Dict[str, Any]] = None,
+):
+    raise APIException(status, code, message, hint=hint, details=details)
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        request.state.request_id = rid
+        resp = await call_next(request)
+        resp.headers["X-Request-ID"] = rid
+        return resp
+
+app.add_middleware(RequestIdMiddleware)
+
+def _rid(request: Request) -> str:
+    return getattr(request.state, "request_id", "-")
+
+# @app.exception_handler(APIException)
+# async def api_exception_handler(request: Request, exc: APIException):
+#     return JSONResponse(
+#         status_code=exc.status_code,
+#         content={"error": exc.detail},
+#     )
+
+@app.exception_handler(APIException)
+async def api_exception_handler(request: Request, exc: APIException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "request_id": _rid(request),
+        },
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Некорректные данные запроса.",
+                "hint": "Проверьте заполнение полей и типы данных.",
+                "details": {"errors": exc.errors()},
+            }
+        },
+    )
+
+
+
+
+auth_router = APIRouter(prefix="/auth", tags=["auth"])
+users_router = APIRouter(prefix="/users", tags=["users"])
+decl_router = APIRouter(prefix="/declarations", tags=["declarations"])
+jobs_router = APIRouter(prefix="/v1", tags=["jobs"])
+admin_router = APIRouter(prefix="/admin", tags=["admin"])
+
+misc_router = APIRouter(tags=["misc"])
+tnved_router = APIRouter(tags=["tnved"])
+company_router = APIRouter(prefix="/company", tags=["company"])
+debug_router = APIRouter(prefix="/debug", tags=["debug"])
+graphs_router = APIRouter(prefix="/graphs", tags=["graphs"])
+files_router = APIRouter(tags=["files"])
+
+
+
+
+
+
 
 origins = [
     "https://ai-declar.ru",
@@ -1846,23 +1865,212 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# @app.exception_handler(StarletteHTTPException)
+# async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+#     return PlainTextResponse(
+#         content=str(exc.detail),
+#         status_code=exc.status_code,
+#     )
+
+# @app.exception_handler(StarletteHTTPException)
+# async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+#     status = exc.status_code
+#     default_map = {
+#         401: ("AUTH_REQUIRED", "Требуется авторизация", "Войдите в систему заново."),
+#         403: ("FORBIDDEN", "Доступ запрещён", "Проверьте права доступа."),
+#         404: ("NOT_FOUND", "Не найдено", "Проверьте ссылку/ID."),
+#         429: ("RATE_LIMIT", "Слишком много запросов", "Подождите немного и попробуйте снова."),
+#     }
+#     code, msg, hint = default_map.get(status, ("HTTP_ERROR", str(exc.detail), None))
+#     return JSONResponse(
+#         status_code=status,
+#         content={
+#             "error": {"code": code, "message": str(exc.detail) if str(exc.detail) else msg, "hint": hint, "details": {}},
+#             "request_id": _rid(request),
+#         },
+#     )
+
 @app.exception_handler(StarletteHTTPException)
-async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    return PlainTextResponse(
-        content=str(exc.detail),
+async def starlette_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail
+
+    if isinstance(detail, dict):
+        payload = {
+            "code": str(detail.get("code") or "HTTP_ERROR"),
+            "message": str(detail.get("message") or "HTTP error"),
+            "hint": str(detail.get("hint") or ""),
+            "details": detail.get("details") or {},
+        }
+    else:
+        payload = {"code": "HTTP_ERROR", "message": str(detail), "hint": "", "details": {}}
+
+    return JSONResponse(
         status_code=exc.status_code,
+        content={
+            "error": payload,
+            "request_id": _rid(request),
+        },
     )
 
-@app.post("/v1/jobs", response_model=EnqueueResp)
-def enqueue_job(body: EnqueueBody):
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Внутренняя ошибка сервера",
+                "hint": "Попробуйте позже. Если ошибка повторяется — сообщите в поддержку.",
+                "details": {},
+            }
+        },
+    )
+
+# def get_current_user(request: Request) -> Dict[str, Any]:
+#     auth = request.headers.get("Authorization") or ""
+#     if not auth.startswith("Bearer "):
+#         raise HTTPException(401, "Missing Bearer token")
+
+#     token = auth.replace("Bearer ", "", 1).strip()
+#     try:
+#         data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+#         sub = data.get("sub")
+#         if not sub:
+#             raise HTTPException(401, "Invalid token")
+#         user_id = int(sub)
+#     except JWTError:
+#         raise HTTPException(401, "Invalid token")
+
+#     user = get_user_by_id(user_id)
+#     if not user:
+#         raise HTTPException(401, "User not found")
+#     user['role'] = (user.get('role') or 'user').lower()
+#     return user
+
+
+def get_current_user(request: Request) -> Dict[str, Any]:
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        api_error(
+            401,
+            "AUTH_MISSING_TOKEN",
+            "Отсутствует токен авторизации",
+            hint="Войдите в систему заново.",
+        )
+
+    token = auth.replace("Bearer ", "", 1).strip()
+    try:
+        data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        sub = data.get("sub")
+        if not sub:
+            api_error(401, "AUTH_INVALID_TOKEN", "Некорректный токен", hint="Войдите в систему заново.")
+        user_id = int(sub)
+    except JWTError:
+        api_error(401, "AUTH_INVALID_TOKEN", "Некорректный токен", hint="Войдите в систему заново.")
+
+    user = get_user_by_id(user_id)
+    if not user:
+        api_error(401, "AUTH_USER_NOT_FOUND", "Пользователь не найден", hint="Войдите в систему заново.")
+    user["role"] = (user.get("role") or "user").lower()
+    if user.get("is_blocked"):
+        api_error(
+            403,
+            "USER_BLOCKED",
+            "Аккаунт заблокирован",
+            hint="Обратитесь в поддержку.",
+            details={"reason": user.get("blocked_reason") or ""},
+        )
+    return user
+
+
+def _norm_role(user: Dict[str, Any]) -> str:
+    return (user.get("role") or "user").strip().lower()
+
+def require_roles(*allowed: str):
+    allowed_set = {str(r).strip().lower() for r in allowed}
+
+    def _dep(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+        role = _norm_role(user)
+        if role not in allowed_set:
+            api_error(
+                403,
+                "FORBIDDEN_ROLE",
+                "Доступ запрещён",
+                hint="Недостаточно прав для этого действия.",
+                details={"role": role, "allowed": sorted(list(allowed_set))},
+            )
+        return user
+
+    return _dep
+
+def require_admin(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    role = (user.get("role") or "user").strip().lower()
+    if role != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_ADMIN_ONLY",
+            "Доступ только для администратора",
+            hint="Войдите под админ-аккаунтом.",
+            details={"role": role},
+        )
+    return user
+
+# def require_declarant_access(user: Dict[str, Any]) -> None:
+#     role = (user.get("role") or "user").lower()
+#     if role not in ("declarant", "tamarix", "admin"):
+#         raise HTTPException(403, "Forbidden")
+
+def require_declarant_access(user: Dict[str, Any]) -> None:
+    role = (user.get("role") or "user").lower()
+    if role not in ("declarant", "tamarix", "admin"):
+        api_error(
+            403,
+            "FORBIDDEN_ROLE",
+            "Недостаточно прав для работы с декларациями",
+            hint="Нужна роль декларанта. Обратитесь в поддержку для активации доступа.",
+            details={"role": role},
+        )
+
+
+@jobs_router.post("/jobs", response_model=EnqueueResp)
+def enqueue_job(body: EnqueueBody, current=Depends(get_current_user)):
+    decl_id = int(body.decl_id)
+    owner_id = int(get_declaration_user_id(decl_id) or 0)
+
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете работать только со своими таможенными декларациями.",
+            details={"decl_id": decl_id, "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+    require_declarant_access(current)
+
     jid = jobs_create(body.decl_id, body.file_id, body.doc_key)
     return EnqueueResp(job_id=jid)
 
-@app.get("/v1/jobs/{job_id}", response_model=JobResp)
-def job_status(job_id: int):
+@jobs_router.get("/jobs/{job_id}", response_model=JobResp)
+def job_status(job_id: int, current=Depends(get_current_user)):
     row = jobs_get(job_id)
     if not row:
-        raise HTTPException(404, "job not found")
+        api_error(404, "JOB_NOT_FOUND", "Задача не найдена", details={"job_id": int(job_id)})
+
+    
+    decl_id = int(row.get("decl_id") or 0)
+    owner_id = int(get_declaration_user_id(decl_id) or 0)
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете смотреть статус только своих задач.",
+            details={"decl_id": decl_id, "job_id": int(job_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+    require_declarant_access(current)
+
     return JobResp(
         job_id=row["id"],
         status=row["status"],
@@ -1870,8 +2078,8 @@ def job_status(job_id: int):
         result=row.get("result_json")
     )
 
-@app.post("/debug/ocr")
-async def debug_ocr(file: UploadFile = File(...)):
+@debug_router.post("/ocr")
+async def debug_ocr(file: UploadFile = File(...), current=Depends(require_admin)):
     file_bytes = await file.read()
     text, meta = extract_text_with_meta(
         file_bytes=file_bytes,
@@ -1885,8 +2093,20 @@ async def debug_ocr(file: UploadFile = File(...)):
     }
 
 
-@app.get("/v1/declarations/{decl_id}/jobs")
-def jobs_by_decl(decl_id: int):
+@decl_router.get("/{decl_id}/jobs")
+def jobs_by_decl(decl_id: int, current=Depends(get_current_user)):
+    owner_id = int(get_declaration_user_id(int(decl_id)) or 0)
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете смотреть задачи только своих таможенных деклараций.",
+            details={"decl_id": int(decl_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+    require_declarant_access(current)
+
     return jobs_list_by_decl(decl_id)
 
 def persist_doc_json(decl_id: int, user_id: int, doc_key: str, data: dict):
@@ -1925,20 +2145,37 @@ class TnvedEnrichItem(BaseModel):
 class TnvedEnrichRequest(BaseModel):
     items: List[TnvedEnrichItem]
 
-@app.get("/v1/declarations/{decl_id}/tnved/goods",response_model=TnvedGoodsListOut,)
-def api_get_tnved_goods(decl_id: int):
+@decl_router.get("/{decl_id}/tnved/goods", tags=["tnved"], response_model=TnvedGoodsListOut,)
+def api_get_tnved_goods(decl_id: int, current=Depends(get_current_user)):
+    owner_id = int(get_declaration_user_id(int(decl_id)) or 0)
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете работать только со своими таможенными декларациями.",
+            details={"decl_id": int(decl_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+    require_declarant_access(current)
     parsed = get_declaration_invoice_json(decl_id)
     if not parsed:
-        raise HTTPException(
-            status_code=404,
-            detail="invoice_json не найден для этой декларации",
+        api_error(
+            404,
+            "INVOICE_JSON_NOT_FOUND",
+            "invoice_json не найден для этой таможенной декларации",
+            hint="Сначала загрузите/обработайте инвойс.",
+            details={"decl_id": int(decl_id)},
         )
 
     goods = parsed.get("Товары")
     if not isinstance(goods, list) or not goods:
-        raise HTTPException(
-            status_code=400,
-            detail="В invoice_json нет списка 'Товары'",
+        api_error(
+            400,
+            "INVOICE_GOODS_EMPTY",
+            "В invoice_json отсутствует список 'Товары'",
+            hint="Проверьте распознанный инвойс или загрузите корректный документ.",
+            details={"decl_id": int(decl_id)},
         )
 
     sender = (
@@ -1993,22 +2230,39 @@ def api_get_tnved_goods(decl_id: int):
 
     return TnvedGoodsListOut(goods=out, count=len(out))
 
-@app.post("/v1/declarations/{decl_id}/tnved/enrich")
-def api_enrich_tnved_for_invoice(decl_id: int, body: TnvedEnrichRequest,):
+@decl_router.post("/{decl_id}/tnved/enrich", tags=["tnved"])
+def api_enrich_tnved_for_invoice(decl_id: int, body: TnvedEnrichRequest, current=Depends(get_current_user)):
+    owner_id = int(get_declaration_user_id(int(decl_id)) or 0)
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете работать только со своими таможенными декларациями.",
+            details={"decl_id": int(decl_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+    require_declarant_access(current)
     parsed = get_declaration_invoice_json(decl_id)
     if not parsed:
-        raise HTTPException(
-            status_code=404,
-            detail="invoice_json не найден для этой декларации",
+        api_error(
+            404,
+            "INVOICE_JSON_NOT_FOUND",
+            "invoice_json не найден для этой таможенной декларации",
+            hint="Сначала загрузите/обработайте инвойс.",
+            details={"decl_id": int(decl_id)},
         )
+
 
     goods = parsed.get("Товары")
     if not isinstance(goods, list) or not goods:
-        raise HTTPException(
-            status_code=400,
-            detail="В invoice_json нет списка 'Товары'",
+        api_error(
+            400,
+            "INVOICE_GOODS_EMPTY",
+            "В invoice_json отсутствует список 'Товары'",
+            hint="Проверьте распознанный инвойс или загрузите корректный документ.",
+            details={"decl_id": int(decl_id)},
         )
-
     extra_by_index: Dict[int, str] = {}
     for it in body.items or []:
         try:
@@ -2028,13 +2282,18 @@ def api_enrich_tnved_for_invoice(decl_id: int, body: TnvedEnrichRequest,):
         g["_user_extra_info"] = val
 
     parsed.setdefault("_doc_key", "invoice")
+
     try:
         parsed_after = enrich_tnved_if_invoice(parsed, fail_soft=False)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Ошибка при определении ТН ВЭД: {e}",
+        api_error(
+            502,
+            "TNVED_ENRICH_FAILED",
+            "Ошибка при определении ТН ВЭД",
+            hint="Попробуйте уточнить описание товара и повторить. Если повторяется — сообщите в поддержку request_id.",
+            details={"decl_id": int(decl_id), "reason": str(e)},
         )
+
     save_declaration_invoice_json(decl_id, parsed_after)
     return {
         "ok": True,
@@ -2128,30 +2387,57 @@ def parse_ofdata_company(payload: Dict[str, Any]) -> Dict[str, Any]:
         "house": house,
     }
 
-@app.get("/company/ofdata")
+@company_router.get("/ofdata")
 def get_company_ofdata(inn: str = Query(..., min_length=10, max_length=12),):
     if not inn.isdigit():
-        raise HTTPException(status_code=400, detail="ИНН должен состоять только из цифр")
+        api_error(
+            400,
+            "INN_NOT_DIGITS",
+            "ИНН должен состоять только из цифр.",
+            hint="Введите ИНН без пробелов и символов.",
+            details={"inn": inn},
+        )
 
     if OFDATA_API_KEY is None:
-        raise HTTPException(status_code=500, detail="OFDATA_API_KEY не настроен на сервере")
+        api_error(
+            500,
+            "OFDATA_CONFIG_MISSING",
+            "OfData API не настроен на сервере.",
+            hint="Добавьте OFDATA_API_KEY в переменные окружения.",
+            details={},
+        )
 
     try:
-        payload = {
-            "key": OFDATA_API_KEY,
-            "inn": inn,
-        }
+        payload = {"key": OFDATA_API_KEY, "inn": inn}
         r = httpx.post(OFDATA_URL, json=payload, timeout=5.0)
     except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Ошибка запроса к OfData: {e}") from e
+        api_error(
+            502,
+            "OFDATA_REQUEST_FAILED",
+            "Ошибка запроса к OfData",
+            hint="Повторите попытку позже.",
+            details={"reason": str(e)},
+        )
 
     if r.status_code == 404:
-        raise HTTPException(status_code=404, detail="Компания с таким ИНН не найдена в ЕГРЮЛ")
+        api_error(
+            404,
+            "COMPANY_NOT_FOUND",
+            "Компания с таким ИНН не найдена в ЕГРЮЛ",
+            hint="Проверьте ИНН.",
+            details={"inn": inn},
+        )
 
     try:
         data = r.json()
     except ValueError:
-        raise HTTPException(status_code=502, detail="Некорректный JSON от OfData")
+        api_error(
+            502,
+            "OFDATA_BAD_JSON",
+            "Некорректный JSON от OfData",
+            hint="Повторите попытку позже.",
+            details={"inn": inn, "status_code": int(r.status_code)},
+        )
 
     meta = data.get("meta") or {}
     left = None
@@ -2164,7 +2450,13 @@ def get_company_ofdata(inn: str = Query(..., min_length=10, max_length=12),):
     try:
         company = parse_ofdata_company(company_raw)
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        api_error(
+            502,
+            "OFDATA_BAD_PAYLOAD",
+            "Некорректные данные компании от OfData",
+            hint="Повторите попытку позже.",
+            details={"inn": inn, "reason": str(e)},
+        )
 
     return {
         "limits_left": left,
@@ -2178,6 +2470,7 @@ class DetectIn(BaseModel):
     manufacturer: str
     product: str
     extra: Optional[str] = None
+    user_id: Optional[int] = None
 
 class AltItem(BaseModel):
     code: Optional[str] = None
@@ -2333,8 +2626,51 @@ def _normalize_requirements(val):
         return [str(val)]
     return []
 
-@app.post("/tnved/detect", response_model=DetectOut)
-def detect(inp: DetectIn, request: Request):
+@tnved_router.post("/tnved/detect", response_model=DetectOut)
+def detect(inp: DetectIn, request: Request, current=Depends(get_current_user)):
+    ip = client_ip(request)
+    rate_limit(f"tnved:{ip}", limit=1, window_sec=60)
+    t0 = time.time()
+
+    uid = int(current["id"])
+    if inp.user_id is not None and int(inp.user_id) != uid:
+        api_error(
+            403,
+            "FORBIDDEN_USER_ID_MISMATCH",
+            "Доступ запрещён",
+            hint="Нельзя выполнять запрос от имени другого пользователя.",
+            details={"inp_user_id": int(inp.user_id), "current_user_id": int(uid)},
+        )
+    
+    role = _norm_role(current)
+    credits_spent = 0
+    if role in {"tamarix", "admin"}:
+        credits_spent = 0
+    else:
+        if role == "user":
+            try:
+                consume_free_credits(uid, 1)
+                credits_spent = 1
+            except HTTPException:
+                credits_consume(
+                    user_id=uid,
+                    amount=1,
+                    ref_type="tnved_request",
+                    ref_id=None,
+                    meta={"path": "/tnved/detect"},
+                )
+                credits_spent = 1
+        else:
+            # declarant и прочие роли — только платные пакеты
+            credits_consume(
+                user_id=uid,
+                amount=1,
+                ref_type="tnved_request",
+                ref_id=None,
+                meta={"path": "/tnved/detect"},
+            )
+            credits_spent = 1
+
     full = (inp.product or "").strip()
     if inp.extra and inp.extra.strip().lower() != "null":
         full += f" ({inp.extra.strip()})"
@@ -2342,7 +2678,13 @@ def detect(inp: DetectIn, request: Request):
         full += f" — Производитель: {inp.manufacturer.strip()}"
 
     if not full:
-        raise HTTPException(status_code=400, detail="Поля пустые")
+        api_error(
+            400,
+            "TNVED_EMPTY_FIELDS",
+            "Поля пустые",
+            hint="Заполните все необходимые поля.",
+            details={},
+        )
 
     system_msg = """Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и по подготовке текстов для графы 31 декларации на товары.
     Ты — эксперт по классификации товаров по ТН ВЭД ЕАЭС и по подготовке текстов для графы 31 декларации на товары.
@@ -2396,7 +2738,13 @@ def detect(inp: DetectIn, request: Request):
             ],
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ошибка GPT API: {e}")
+        api_error(
+            502,
+            "GPT_API_ERROR",
+            "Ошибка GPT API",
+            hint="Повторите попытку позже.",
+            details={"reason": str(e)},
+        )
 
     text = (resp.output_text or "").strip()
     data = _extract_json_block(text) or {}
@@ -2420,22 +2768,39 @@ def detect(inp: DetectIn, request: Request):
     decl31 = (data.get("decl31") or "").strip()
 
     out = DetectOut(
-        code=code,
-        duty=duty,
-        vat=vat,
-        raw=text,
-        description=(data.get("description") or ""),
-        tech31=tech31,
-        decl31=decl31,
-        classification_reason=(data.get("classification_reason") or ""),
-        alternatives=alternatives,
-        payments=payments,
-        requirements=requirements,
-    )
+    code=code,
+    duty=duty,
+    vat=vat,
+    raw=text,
+    description=(data.get("description") or ""),
+    tech31=tech31,
+    decl31=decl31,
+    classification_reason=(data.get("classification_reason") or ""),
+    alternatives=alternatives,
+    payments=payments,
+    requirements=requirements,)
+
+    latency_ms = int((time.time() - t0) * 1000)
+    if uid:
+        try:
+            tnved_requests_add(
+                user_id=int(inp.user_id),
+                query_text=full,
+                input_json={"manufacturer": inp.manufacturer, "product": inp.product, "extra": inp.extra},
+                result_json=out.model_dump(),
+                status="done",
+                credits_spent=1,
+                model="gpt-5",
+                latency_ms=latency_ms,
+            )
+        except Exception as e:
+            print("[tnved_requests_add] error:", e)
+
+
     return out
 
 
-@app.post("/feedback")
+@misc_router.post("/feedback", tags=["feedback"])
 def feedback(fb: FeedbackIn, request: Request):
     saved = False
     error = None
@@ -2453,7 +2818,7 @@ def feedback(fb: FeedbackIn, request: Request):
         "error": error  
     }
 
-@app.get("/")
+@misc_router.get("/")
 def root():
     return {"status": "Проверка работоспособности"}
 
@@ -2465,6 +2830,8 @@ class UserOut(BaseModel):
     name: str
     surname: str
     avatar_path: str
+    role: str
+    must_change_password: bool = False  # NEW
 
 class UserRegisterIn(BaseModel):
     name: str
@@ -2491,12 +2858,24 @@ class AvatarUploadResp(BaseModel):
     file_id: int
     avatar_path: str 
 
+# class DeclarationOut(BaseModel):
+#     id: int
+#     title: str
+#     created_at: datetime
+#     attached_file_id: Optional[int] = None
+#     file_name: Optional[str] = None
+
 class DeclarationOut(BaseModel):
     id: int
     title: str
     created_at: datetime
     attached_file_id: Optional[int] = None
+
     file_name: Optional[str] = None
+    files_count: int = 0
+    doc_keys: list[str] = []
+
+
 
 class DeclarationCreateIn(BaseModel):
     title: str
@@ -2521,21 +2900,21 @@ class FileUploadResp(BaseModel):
 APP_TZ = ZoneInfo("Europe/Moscow") 
 
 
-#pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# def hash_password(password: str) -> str:
-#     return pwd_context.hash(password)
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-# def verify_password(password: str, password_hash: str) -> bool:
-#     try:
-#         return pwd_context.verify(password, password_hash)
-#     except Exception:
-#         return False
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return pwd_context.verify(password, password_hash)
+    except Exception:
+        return False
 
-# def looks_like_hash(s: str) -> bool:
-#     if not s:
-#         return False
-#     return s.startswith("$2a$") or s.startswith("$2b$") or s.startswith("$2y$")
+def looks_like_hash(s: str) -> bool:
+    if not s:
+        return False
+    return s.startswith("$2a$") or s.startswith("$2b$") or s.startswith("$2y$")
 
 def _user_to_out(row: Dict[str, Any]) -> UserOut:
     return UserOut(
@@ -2544,22 +2923,93 @@ def _user_to_out(row: Dict[str, Any]) -> UserOut:
         name=row.get("name") or "",
         surname=row.get("surname") or "",
         avatar_path=row.get("avatar_path") or "",
+        role=row.get("role"),
+        must_change_password=bool(row.get("must_change_password") or False),  # NEW
     )
 
-@app.post("/auth/register", response_model=UserOut)
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+def create_access_token(*, user_id: int) -> str:
+    exp = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MIN)
+    payload = {"sub": str(user_id), "exp": exp}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+# def require_owner(path_user_id: int, user: Optional[Dict[str, Any]]) -> None:
+#     if not user:
+#         raise HTTPException(401, "Not authenticated")
+#     if int(path_user_id) != int(user.get("id")):
+#         raise HTTPException(403, "Forbidden (not your resource)")
+
+def require_owner(path_user_id: int, user: Optional[Dict[str, Any]]) -> None:
+    if not user:
+        api_error(401, "AUTH_REQUIRED", "Требуется авторизация", hint="Войдите в систему.")
+    if int(path_user_id) != int(user.get("id")):
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете работать только со своими данными.",
+            details={"path_user_id": int(path_user_id), "current_user_id": int(user.get("id"))},
+        )
+
+
+# @auth_router.post("/register", response_model=TokenOut)
+# def auth_register(body: UserRegisterIn):
+#     existing = get_user_by_email(body.email)
+#     if existing:
+#         raise HTTPException(400, "Пользователь с таким email уже существует")
+
+#     # пока поддерживаем миграцию: храним bcrypt
+#     user_id = create_user(
+#         name=body.name,
+#         surname=body.surname,
+#         email=body.email,
+#         password=hash_password(body.password),
+#     )
+#     user = get_user_by_id(user_id)
+
+#     token = create_access_token(user_id=int(user_id))
+#     return TokenOut(access_token=token, user=_user_to_out(user))
+
+
+@auth_router.post("/register", response_model=TokenOut)
 def auth_register(body: UserRegisterIn):
     existing = get_user_by_email(body.email)
     if existing:
-        raise HTTPException(400, "Пользователь с таким email уже существует")
+        api_error(
+            400,
+            "AUTH_EMAIL_EXISTS",
+            "Пользователь с таким email уже существует",
+            hint="Попробуйте войти или используйте другой email.",
+            details={"email": body.email},
+        )
 
-    user_id = create_user(
-        name=body.name,
-        surname=body.surname,
-        email=body.email,
-        password=body.password,
-    )
+    try:
+        user_id = create_user(
+            name=body.name,
+            surname=body.surname,
+            email=body.email,
+            password=hash_password(body.password),
+        )
+    except Exception as e:
+        api_error(
+            500,
+            "DB_CREATE_USER_FAILED",
+            "Не удалось создать пользователя.",
+            hint="Попробуйте позже. Если повторяется — сообщите request_id в поддержку.",
+            details={"reason": str(e)},
+        )
+
     user = get_user_by_id(user_id)
-    return _user_to_out(user)
+    if not user:
+        api_error(500, "DB_USER_READ_FAILED", "Пользователь создан, но не читается из БД", hint="Сообщите request_id.")
+
+    token = create_access_token(user_id=int(user_id))
+    return TokenOut(access_token=token, user=_user_to_out(user))
 
 # @app.post("/auth/login", response_model=UserOut)
 # def auth_login(body: UserLoginIn):
@@ -2585,24 +3035,97 @@ def auth_register(body: UserRegisterIn):
 
 #     return _user_to_out(user)
 
-@app.post("/auth/login", response_model=UserOut)
-def auth_login(body: UserLoginIn):
+# @auth_router.post("/login", response_model=TokenOut)
+# def auth_login(body: UserLoginIn, request: Request):
+#     ip = client_ip(request)
+#     rate_limit(f"login:{ip}:{body.email}", limit=10, window_sec=60)
+#     user = get_user_by_email(body.email)
+#     if not user:
+#         raise HTTPException(401, "Неверный email или пароль")
+
+#     stored = (user.get("password") or "").strip()
+
+#     ok = False
+#     if looks_like_hash(stored):
+#         ok = verify_password(body.password, stored)
+#     else:
+#         ok = (stored == body.password)
+#         if ok:
+#             try:
+#                 update_user(int(user["id"]), password=hash_password(body.password))
+#             except Exception:
+#                 pass
+
+#     if not ok:
+#         raise HTTPException(401, "Неверный email или пароль")
+
+#     token = create_access_token(user_id=int(user["id"]))
+#     return TokenOut(access_token=token, user=_user_to_out(user))
+
+@auth_router.post("/login", response_model=TokenOut)
+def auth_login(body: UserLoginIn, request: Request):
+    ip = client_ip(request)
+    rate_limit(f"login:{ip}:{body.email}", limit=10, window_sec=60)
+
     user = get_user_by_email(body.email)
     if not user:
-        raise HTTPException(401, "Неверный email или пароль")
+        api_error(
+            401,
+            "AUTH_BAD_CREDENTIALS",
+            "Неверный email или пароль.",
+            hint="Проверьте данные. Если забыли пароль — напишите администратору",
+        )
 
     stored = (user.get("password") or "").strip()
 
-    if stored != body.password:
-        raise HTTPException(401, "Неверный email или пароль")
+    ok = False
+    if looks_like_hash(stored):
+        ok = verify_password(body.password, stored)
+    else:
+        ok = (stored == body.password)
+        if ok:
+            try:
+                update_user(int(user["id"]), password=hash_password(body.password))
+            except Exception:
+                pass
 
-    return _user_to_out(user)
+    if not ok:
+        api_error(
+            401,
+            "AUTH_BAD_CREDENTIALS",
+            "Неверный email или пароль.",
+            hint="Проверьте данные. Если забыли пароль — напишите администратору",
+        )
 
-@app.get("/users/{user_id}/profile", response_model=UserProfileIn)
-def get_profile(user_id: int):
-    user = get_user_by_id(user_id)
+    token = create_access_token(user_id=int(user["id"]))
+    return TokenOut(access_token=token, user=_user_to_out(user))
+
+
+
+@users_router.get("/{user_id}/profile", response_model=UserProfileIn)
+def get_profile(user_id: int, current=Depends(get_current_user)):
+    require_owner(user_id, current)
+
+    try:
+        user = get_user_by_id(user_id)
+    except Exception as e:
+        api_error(
+            500,
+            "DB_USER_READ_FAILED",
+            "Не удалось прочитать профиль.",
+            hint="Попробуйте позже. Если повторяется — сообщите request_id в поддержку.",
+            details={"user_id": int(user_id), "reason": str(e)},
+        )
+
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        api_error(
+            404,
+            "USER_NOT_FOUND",
+            "Пользователь не найден.",
+            hint="Проверьте ссылку/ID.",
+            details={"user_id": int(user_id)},
+        )
+
     return UserProfileIn(
         name=user.get("name"),
         surname=user.get("surname"),
@@ -2615,17 +3138,37 @@ def get_profile(user_id: int):
         avatar_path=user.get("avatar_path"),
     )
 
-@app.put("/users/{user_id}/profile", response_model=UserProfileIn)
-def update_profile(user_id: int, body: UserProfileIn):
-    user = get_user_by_id(user_id)
+@users_router.put("/{user_id}/profile", response_model=UserProfileIn)
+def update_profile(user_id: int, body: UserProfileIn, current=Depends(get_current_user)):
+    require_owner(user_id, current)
+
+    try:
+        user = get_user_by_id(user_id)
+    except Exception as e:
+        api_error(500, "DB_USER_READ_FAILED", "Не удалось прочитать профиль.", details={"user_id": int(user_id), "reason": str(e)})
+
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден", details={"user_id": int(user_id)})
 
     fields = body.model_dump(exclude_unset=True)
-    if fields:
-        update_user(user_id, **fields)
 
-    updated = get_user_by_id(user_id)
+    if fields:
+        try:
+            update_user(user_id, **fields)
+        except Exception as e:
+            api_error(
+                500,
+                "DB_USER_UPDATE_FAILED",
+                "Не удалось обновить профиль.",
+                hint="Попробуйте позже. Если повторяется — сообщите request_id в поддержку.",
+                details={"user_id": int(user_id), "fields": sorted(list(fields.keys())), "reason": str(e)},
+            )
+
+    try:
+        updated = get_user_by_id(user_id)
+    except Exception as e:
+        api_error(500, "DB_USER_READ_FAILED", "Профиль обновлён, но не читается.", details={"user_id": int(user_id), "reason": str(e)})
+
     return UserProfileIn(
         name=updated.get("name"),
         surname=updated.get("surname"),
@@ -2638,15 +3181,34 @@ def update_profile(user_id: int, body: UserProfileIn):
         avatar_path=updated.get("avatar_path"),
     )
 
-@app.get("/users/{user_id}/declarations", response_model=list[DeclarationOut])
-def api_list_declarations(user_id: int):
-    rows = list_declarations(user_id, limit=500) or []
+@users_router.get("/{user_id}/declarations", response_model=list[DeclarationOut])
+def api_list_declarations(user_id: int, current=Depends(get_current_user)):
+    require_owner(user_id, current)
+    require_declarant_access(current)
+
+    try:
+        rows = list_declarations(user_id, limit=500) or []
+    except Exception as e:
+        api_error(
+            500,
+            "DB_DECLARATIONS_LIST_FAILED",
+            "Не удалось получить список деклараций.",
+            hint="Попробуйте позже. Если повторяется — сообщите request_id в поддержку.",
+            details={"user_id": int(user_id), "reason": str(e)},
+        )
+
     return [DeclarationOut(**r) for r in rows]
 
-@app.post("/users/{user_id}/declarations", response_model=DeclarationOut)
-def api_create_declaration(user_id: int, body: DeclarationCreateIn):
-    now = datetime.now(APP_TZ)
+@users_router.post("/{user_id}/declarations", response_model=DeclarationOut)
+def api_create_declaration(user_id: int, body: DeclarationCreateIn, current=Depends(get_current_user)):
+    require_owner(user_id, current)
+    require_declarant_access(current)
 
+    title = (body.title or "").strip()
+    if not title:
+        api_error(400, "DECL_TITLE_EMPTY", "Название декларации не заполнено", hint="Укажите название.")
+
+    now = datetime.now(APP_TZ)
     created_at = None
     if body.created_date:
         created_at = now.replace(
@@ -2655,21 +3217,96 @@ def api_create_declaration(user_id: int, body: DeclarationCreateIn):
             day=body.created_date.day,
         )
 
-    decl_id = add_declaration(user_id=user_id, title=body.title, created_at=created_at)
-    row = next((d for d in list_declarations(user_id) if d["id"] == decl_id), None)
+    try:
+        decl_id = add_declaration(user_id=user_id, title=title, created_at=created_at)
+    except Exception as e:
+        api_error(
+            500,
+            "DB_DECLARATION_CREATE_FAILED",
+            "Не удалось создать декларацию.",
+            hint="Попробуйте позже. Если повторяется — сообщите request_id в поддержку.",
+            details={"user_id": int(user_id), "reason": str(e)},
+        )
+
+    try:
+        row = next((d for d in (list_declarations(user_id) or []) if int(d.get("id") or 0) == int(decl_id)), None)
+    except Exception as e:
+        api_error(
+            500,
+            "DB_DECLARATION_READ_FAILED",
+            "Декларация создана, но не читается из БД.",
+            hint="Сообщите request_id в поддержку.",
+            details={"user_id": int(user_id), "decl_id": int(decl_id), "reason": str(e)},
+        )
+
     if not row:
-        raise HTTPException(500, "Не удалось прочитать созданную декларацию")
+        api_error(
+            500,
+            "DB_DECLARATION_READ_FAILED",
+            "Декларация создана, но не найдена в списке.",
+            hint="Сообщите request_id в поддержку.",
+            details={"user_id": int(user_id), "decl_id": int(decl_id)},
+        )
+
     return DeclarationOut(**row)
 
 
-@app.get("/declarations/{decl_id}/files", response_model=list[DeclFileOut])
-def api_list_decl_files(decl_id: int):
-    rows = list_declaration_files(decl_id) or []
+@files_router.get("/declarations/{decl_id}/files", response_model=list[DeclFileOut])
+def api_list_decl_files(decl_id: int, current=Depends(get_current_user)):
+    try:
+        owner_id = int(get_declaration_user_id(decl_id) or 0)
+    except Exception as e:
+        api_error(500, "DB_DECL_OWNER_READ_FAILED", "Не удалось проверить владельца декларации.", details={"decl_id": int(decl_id), "reason": str(e)})
+
+    if owner_id <= 0:
+        api_error(404, "DECLARATION_NOT_FOUND", "Декларация не найдена", details={"decl_id": int(decl_id)})
+
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете работать только со своими декларациями.",
+            details={"decl_id": int(decl_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+    require_declarant_access(current)
+
+    try:
+        rows = list_declaration_files(decl_id) or []
+    except Exception as e:
+        api_error(500, "DB_DECL_FILES_LIST_FAILED", "Не удалось получить список файлов.", details={"decl_id": int(decl_id), "reason": str(e)})
+
     return [DeclFileOut(**r) for r in rows]
 
-@app.post("/declarations/{decl_id}/files", response_model=FileUploadResp)
-async def api_upload_decl_file(decl_id: int,user_id: int = Form(...),doc_key: str = Form(...),file: UploadFile = File(...),):
+@files_router.post("/declarations/{decl_id}/files", response_model=FileUploadResp)
+async def api_upload_decl_file(
+    decl_id: int,
+    doc_key: str = Form(...),
+    file: UploadFile = File(...),
+    current=Depends(get_current_user),
+):
+    doc_key = (doc_key or "").strip()
+    if not doc_key:
+        api_error(400, "DOC_KEY_EMPTY", "Не указан тип документа (doc_key)", hint="Выберите тип документа.")
+
+    try:
+        owner_id = int(get_declaration_user_id(int(decl_id)) or 0)
+    except Exception as e:
+        api_error(500, "DB_DECL_OWNER_READ_FAILED", "Не удалось проверить владельца декларации.", details={"decl_id": int(decl_id), "reason": str(e)})
+
+    if owner_id <= 0:
+        api_error(404, "DECLARATION_NOT_FOUND", "Декларация не найдена", details={"decl_id": int(decl_id)})
+
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(403, "FORBIDDEN_NOT_OWNER", "Доступ запрещён", hint="Вы можете работать только со своими декларациями.", details={"decl_id": int(decl_id)})
+
+    require_declarant_access(current)
+
     data = await file.read()
+    if not data:
+        api_error(400, "FILE_EMPTY", "Пустой файл", hint="Выберите файл и попробуйте снова.")
+    
     pages = 0
     mime = file.content_type or ""
 
@@ -2682,17 +3319,26 @@ async def api_upload_decl_file(decl_id: int,user_id: int = Form(...),doc_key: st
     MAX_PDF_PAGES = 3
 
     if pages > MAX_PDF_PAGES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"PDF содержит {pages} страниц. "
-                f"Допустимо не более {MAX_PDF_PAGES} страниц для автоматического OCR. "
-                f"Разбейте документ на части по ссылке ниже:"
-            )
+        api_error(
+            413,
+            "PDF_TOO_MANY_PAGES",
+            "Слишком большой PDF для автоматического OCR",
+            hint="Разбейте документ на несколько файлов и загрузите по частям.",
+            details={"pages": int(pages), "max_pages": int(MAX_PDF_PAGES)},
         )
-    mime = file.content_type or "application/octet-stream"
-    file_id = add_file(user_id, file.filename, mime, data)
-    link_file_to_declaration(decl_id, file_id, doc_key, replace=False)
+
+    try:
+        mime = file.content_type or "application/octet-stream"
+        file_id = add_file(int(current["id"]), file.filename, mime, data)
+        link_file_to_declaration(decl_id, file_id, doc_key, replace=False)
+    except Exception as e:
+        api_error(
+            500,
+            "DB_FILE_UPLOAD_FAILED",
+            "Не удалось сохранить файл.",
+            hint="Попробуйте позже. Если повторяется — сообщите request_id в поддержку.",
+            details={"decl_id": int(decl_id), "doc_key": doc_key, "filename": file.filename, "reason": str(e)},
+        )
 
     return FileUploadResp(
         file_id=file_id,
@@ -2702,12 +3348,19 @@ async def api_upload_decl_file(decl_id: int,user_id: int = Form(...),doc_key: st
         size_bytes=len(data),
     )
 
-@app.get("/files/{file_id}/download")
-def api_download_file(file_id: int):
-    rec = get_file(file_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="Файл не найден")
+@files_router.get("/files/{file_id}/download")
+def api_download_file(file_id: int, current=Depends(get_current_user)):
+    try:
+        rec = get_file(file_id)
+    except Exception as e:
+        api_error(500, "DB_FILE_READ_FAILED", "Не удалось прочитать файл.", details={"file_id": int(file_id), "reason": str(e)})
 
+    if not rec:
+        api_error(404, "FILE_NOT_FOUND", "Файл не найден", details={"file_id": int(file_id)})
+
+    if int(rec.get("user_id") or 0) != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(403, "FORBIDDEN_NOT_OWNER", "Доступ запрещён", hint="Вы можете скачивать только свои файлы.", details={"file_id": int(file_id)})
+    
     filename = rec.get("filename") or "file.pdf"
     safe_name = "".join(ch if ord(ch) < 128 else "_" for ch in filename)
     if not safe_name:
@@ -2721,29 +3374,57 @@ def api_download_file(file_id: int):
         },
     )
 
-@app.delete("/declarations/{decl_id}/files/{file_id}")
-def api_unlink_file(decl_id: int, file_id: int):
-    deleted = unlink_file_from_declaration(decl_id, file_id)
+@files_router.delete("/declarations/{decl_id}/files/{file_id}")
+def api_unlink_file(decl_id: int, file_id: int, current=Depends(get_current_user)):
+    owner_id = int(get_declaration_user_id(decl_id) or 0)
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете работать только со своими таможенными декларациями.",
+            details={"decl_id": int(decl_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+    require_declarant_access(current)
+    try:
+        deleted = unlink_file_from_declaration(decl_id, file_id)
+    except Exception as e:
+        api_error(500, "DB_DECL_FILE_UNLINK_FAILED", "Не удалось отвязать файл.", details={"decl_id": int(decl_id), "file_id": int(file_id), "reason": str(e)})
+
     if not deleted:
-        raise HTTPException(404, "Связь декларации и файла не найдена")
+        api_error(404, "DECL_FILE_LINK_NOT_FOUND", "Связь декларации и файла не найдена", details={"decl_id": int(decl_id), "file_id": int(file_id)})
     return {"status": "ok", "deleted": deleted}
 
-@app.post("/users/{user_id}/avatar", response_model=AvatarUploadResp)
-async def upload_avatar(user_id: int, file: UploadFile = File(...)):
+@users_router.post("/{user_id}/avatar", response_model=AvatarUploadResp)
+async def upload_avatar(user_id: int, file: UploadFile = File(...), current=Depends(get_current_user)):
+    require_owner(user_id, current)
     user = get_user_by_id(user_id)
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден", details={"user_id": int(user_id)})
 
     content_type = (file.content_type or "").lower()
     if not content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Ожидается файл изображения")
+        api_error(
+            400,
+            "AVATAR_BAD_MIME",
+            "Ожидается файл изображения",
+            hint="Загрузите PNG/JPG/WebP.",
+            details={"content_type": content_type},
+        )
 
     data = await file.read()
     if not data:
-        raise HTTPException(status_code=400, detail="Пустой файл")
+        api_error(400, "FILE_EMPTY", "Пустой файл", hint="Выберите файл и повторите.", details={})
     max_size = 5 * 1024 * 1024
     if len(data) > max_size:
-        raise HTTPException(status_code=400, detail="Слишком большой файл аватара (>5 МБ)")
+        api_error(
+            413,
+            "AVATAR_TOO_LARGE",
+            "Слишком большой файл аватара",
+            hint="Максимум 5 МБ.",
+            details={"max_size": max_size, "size": len(data)},
+        )
     mime = content_type or "application/octet-stream"
     file_id = add_file(user_id, file.filename, mime, data)
 
@@ -2751,6 +3432,1071 @@ async def upload_avatar(user_id: int, file: UploadFile = File(...)):
     update_user(user_id, avatar_path=avatar_path)
 
     return AvatarUploadResp(file_id=file_id, avatar_path=avatar_path)
+
+
+
+
+class TnvedRequestOut(BaseModel):
+    id: int
+    user_id: int
+    query_text: Optional[str] = None
+    input_json: Optional[dict] = None
+    result_json: Optional[dict] = None
+    status: str
+    error_text: Optional[str] = None
+    credits_spent: int
+    model: Optional[str] = None
+    latency_ms: Optional[int] = None
+    created_at: Optional[str] = None  # можно и datetime, но строкой проще на фронте
+
+
+class PaymentHistoryOut(BaseModel):
+    id: int
+    user_id: int
+    provider: str
+    provider_payment_id: Optional[str] = None
+    tariff_plan_id: Optional[int] = None
+    amount_value: str
+    currency: str
+    status: str
+    paid_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+    tariff_code: Optional[str] = None
+    tariff_title: Optional[str] = None
+    tariff_credits: Optional[int] = None
+    tariff_price_rub: Optional[int] = None
+
+
+@users_router.get("/{user_id}/tnved-requests", response_model=list[TnvedRequestOut])
+def api_list_tnved_requests(user_id: int, limit: int = 200, offset: int = 0, current=Depends(get_current_user)):
+    require_owner(user_id, current)
+    rows = tnved_requests_list_by_user(user_id, limit=limit, offset=offset) or []
+    out = []
+    for r in rows:
+        rr = dict(r)
+        if rr.get("created_at") is not None:
+            rr["created_at"] = rr["created_at"].isoformat()
+        out.append(rr)
+    return out
+
+
+@users_router.get("/{user_id}/payments", response_model=list[PaymentHistoryOut])
+def api_list_payments(user_id: int, limit: int = 200, offset: int = 0, current=Depends(get_current_user)):
+    require_owner(user_id, current)
+    rows = payments_list_by_user(user_id, limit=limit, offset=offset) or []
+    out = []
+    for r in rows:
+        rr = dict(r)
+        if rr.get("created_at") is not None:
+            rr["created_at"] = rr["created_at"].isoformat()
+        if rr.get("paid_at") is not None:
+            rr["paid_at"] = rr["paid_at"].isoformat()
+        out.append(rr)
+    return out
+
+
+######################## Админ-панель #####################################
+
+class AdminUserRow(BaseModel):
+    id: int
+    email: Optional[str] = None
+    name: Optional[str] = None
+    surname: Optional[str] = None
+    avatar_path: Optional[str] = None
+
+
+class AdminDeclarationRow(BaseModel):
+    id: int
+    user_id: int
+    title: str
+    created_at: Optional[datetime] = None
+
+
+class AdminDeclarationDetails(BaseModel):
+    id: int
+    user_id: int
+    title: str
+    created_at: Optional[datetime] = None
+
+
+class AdminJobRow(BaseModel):
+    id: int
+    decl_id: int
+    file_id: int
+    filename: Optional[str] = None  # NEW
+    doc_key: Optional[str] = None
+    status: str
+    attempts: Optional[int] = None
+    error_text: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+class AdminMetricsOut(BaseModel):
+    jobs_24h: Dict[str, int]
+    jobs_avg_seconds_24h: float
+
+    tnved_requests_24h: int
+    tnved_unknown_24h: int
+    tnved_avg_latency_ms_24h: int
+
+    payments_24h: Dict[str, int]
+    last_payment_succeeded_at: Optional[str] = None
+
+class AdminJobDetails(AdminJobRow):
+    pass
+
+class AdminPaymentRow(BaseModel):
+    id: int
+    user_id: int
+    provider: str
+    provider_payment_id: Optional[str] = None
+    tariff_plan_id: Optional[int] = None
+    amount_value: str
+    currency: str
+    status: str
+    paid_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+class AdminLedgerRow(BaseModel):
+    id: int
+    user_id: int
+    amount: int
+    ref_type: str
+    ref_id: Optional[int] = None
+    meta: Optional[dict] = None
+    created_at: Optional[str] = None
+
+class AdminCreditsAdjustIn(BaseModel):
+    amount: int
+    reason: Optional[str] = None
+
+class AdminBlockIn(BaseModel):
+    reason: Optional[str] = None
+    
+class AdminResetPasswordOut(BaseModel):
+    status: str
+    user_id: int
+    temp_password: str
+
+def _gen_temp_password(n: int = 12) -> str:
+    import secrets, string
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+@admin_router.post("/users/{user_id}/reset-password", response_model=AdminResetPasswordOut)
+def admin_reset_password(user_id: int, current=Depends(require_admin)):
+    u = get_user_by_id(int(user_id))
+    if not u:
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден", hint="Проверьте user_id.")
+
+    temp = _gen_temp_password(12)
+    try:
+        # важно: и пароль обновляем, и флаг включаем
+        set_user_password_and_flag(int(user_id), hash_password(temp), True)
+    except Exception as e:
+        api_error(500, "DB_RESET_PASSWORD_FAILED", "Не удалось сбросить пароль", details={"reason": str(e)})
+
+    return {"status": "ok", "user_id": int(user_id), "temp_password": temp}
+
+class ChangePasswordIn(BaseModel):
+    old_password: str
+    new_password: str
+
+@users_router.post("/{user_id}/change-password")
+def change_password(user_id: int, body: ChangePasswordIn, current=Depends(get_current_user)):
+    require_owner(user_id, current)
+
+    u = get_user_by_id(int(user_id))
+    if not u:
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден")
+
+    stored = (u.get("password") or "").strip()
+    ok = False
+    if looks_like_hash(stored):
+        ok = verify_password(body.old_password, stored)
+    else:
+        ok = (stored == body.old_password)
+
+    if not ok:
+        api_error(
+            400,
+            "PASSWORD_OLD_INVALID",
+            "Текущий пароль неверный",
+            hint="Проверьте текущий пароль и попробуйте снова.",
+        )
+
+    if not (body.new_password or "").strip():
+        api_error(400, "PASSWORD_NEW_EMPTY", "Новый пароль пустой", hint="Введите новый пароль.")
+    if len(body.new_password.strip()) < 8:
+        api_error(400, "PASSWORD_TOO_SHORT", "Слишком короткий пароль", hint="Минимум 8 символов.")
+
+    try:
+        set_user_password_and_flag(int(user_id), hash_password(body.new_password.strip()), False)
+    except Exception as e:
+        api_error(500, "DB_CHANGE_PASSWORD_FAILED", "Не удалось обновить пароль", details={"reason": str(e)})
+
+    return {"status": "ok"}
+
+
+@admin_router.post("/users/{user_id}/block")
+def admin_block_user(user_id: int, body: AdminBlockIn, current=Depends(require_admin)):
+    ok = set_user_block(
+        int(user_id),
+        is_blocked=True,
+        reason=(body.reason or "").strip(),
+        blocked_at=datetime.now(APP_TZ),
+    )
+    if not ok:
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден", details={"user_id": int(user_id)})
+    return {"ok": True, "user_id": int(user_id), "is_blocked": True}
+
+
+@admin_router.post("/users/{user_id}/unblock")
+def admin_unblock_user(user_id: int, current=Depends(require_admin)):
+    ok = set_user_block(int(user_id), is_blocked=False)
+    if not ok:
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден", details={"user_id": int(user_id)})
+    return {"ok": True, "user_id": int(user_id), "is_blocked": False}
+
+def as_dict(row: Any, keys: List[str]) -> Dict[str, Any]:
+    """
+    Поддержка и dict-строк (RealDictCursor), и tuple-строк.
+    """
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    # tuple/list
+    return {k: row[i] for i, k in enumerate(keys) if i < len(row)}
+
+
+@admin_router.get("/health")
+def admin_health(current=Depends(require_admin)):
+    return {"status": "ok"}
+
+
+@admin_router.get("/users", response_model=List[AdminUserRow])
+def admin_users(q: str = "", limit: int = 50, offset: int = 0, current=Depends(require_admin)):
+    q_like = f"%{q}%"
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, email, name, surname, avatar_path
+            FROM users
+            WHERE (%s = '' OR email ILIKE %s OR name ILIKE %s OR surname ILIKE %s)
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (q, q_like, q_like, q_like, limit, offset),
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+    out: List[AdminUserRow] = []
+    keys = ["id", "email", "name", "surname", "avatar_path"]
+    for r in rows:
+        d = as_dict(r, keys)
+        out.append(
+            AdminUserRow(
+                id=int(d["id"]),
+                email=d.get("email"),
+                name=d.get("name"),
+                surname=d.get("surname"),
+                avatar_path=(d.get("avatar_path") or ""),
+            )
+        )
+    return out
+
+
+@admin_router.get("/users/{user_id}", response_model=AdminUserRow)
+def admin_user_details(user_id: int, current=Depends(require_admin)):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, email, name, surname, avatar_path
+            FROM users
+            WHERE id = %s
+            """,
+            (user_id,),
+        )
+        r = cur.fetchone()
+        cur.close()
+
+    if not r:
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден", details={"user_id": int(user_id)})
+
+    d = as_dict(r, ["id", "email", "name", "surname", "avatar_path"])
+    return AdminUserRow(
+        id=int(d["id"]),
+        email=d.get("email"),
+        name=d.get("name"),
+        surname=d.get("surname"),
+        avatar_path=(d.get("avatar_path") or ""),
+    )
+
+class AdminSetRoleIn(BaseModel):
+    role: str
+
+@admin_router.post("/users/{user_id}/role")
+def admin_set_user_role(user_id: int, body: AdminSetRoleIn, current=Depends(require_admin)):
+    try:
+        set_user_role(user_id, body.role)
+    except ValueError as e:
+        api_error(
+            400,
+            "ADMIN_BAD_ROLE",
+            "Некорректная роль",
+            hint="Проверьте список допустимых ролей.",
+            details={"user_id": int(user_id), "role": body.role, "reason": str(e)},
+        )
+    return {"status": "ok", "user_id": user_id, "role": body.role}
+
+@admin_router.get("/declarations", response_model=List[AdminDeclarationRow])
+def admin_declarations(user_id: int = 0, q: str = "", limit: int = 50, offset: int = 0, current=Depends(require_admin)):
+    q_like = f"%{q}%"
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        if user_id:
+            cur.execute(
+                """
+                SELECT id, user_id, title, created_at
+                FROM declarations
+                WHERE user_id = %s AND (%s = '' OR title ILIKE %s)
+                ORDER BY id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user_id, q, q_like, limit, offset),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, user_id, title, created_at
+                FROM declarations
+                WHERE (%s = '' OR title ILIKE %s)
+                ORDER BY id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (q, q_like, limit, offset),
+            )
+
+        rows = cur.fetchall()
+        cur.close()
+
+    out: List[AdminDeclarationRow] = []
+    keys = ["id", "user_id", "title", "created_at"]
+    for r in rows:
+        d = as_dict(r, keys)
+        out.append(
+            AdminDeclarationRow(
+                id=int(d["id"]),
+                user_id=int(d["user_id"]),
+                title=d.get("title") or "",
+                created_at=d.get("created_at"),
+            )
+        )
+    return out
+
+
+@admin_router.get("/declarations/{decl_id}", response_model=AdminDeclarationDetails)
+def admin_declaration_details(decl_id: int, current=Depends(require_admin)):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, user_id, title, created_at
+            FROM declarations
+            WHERE id = %s
+            """,
+            (decl_id,),
+        )
+        r = cur.fetchone()
+        cur.close()
+
+    if not r:
+        api_error(404, "DECLARATION_NOT_FOUND", "Таможенная декларация не найдена", details={"decl_id": int(decl_id)})
+
+
+    d = as_dict(r, ["id", "user_id", "title", "created_at"])
+    return AdminDeclarationDetails(
+        id=int(d["id"]),
+        user_id=int(d["user_id"]),
+        title=d.get("title") or "",
+        created_at=d.get("created_at"),
+    )
+
+
+@admin_router.get("/jobs", response_model=List[AdminJobRow])
+def admin_jobs(status: str = "", decl_id: int = 0, limit: int = 50, offset: int = 0, current=Depends(require_admin)):
+    where = []
+    params: List[Any] = []
+
+    if status:
+        where.append("status = %s")
+        params.append(status)
+
+    if decl_id:
+        where.append("decl_id = %s")
+        params.append(decl_id)
+
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " AND ".join(where)
+
+    params.extend([limit, offset])
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT j.id, j.decl_id, j.file_id, f.filename, j.doc_key, j.status, j.attempts, j.error_text, j.created_at
+            FROM jobs j
+            LEFT JOIN files f ON f.id = j.file_id
+            {where_sql}
+            ORDER BY j.id DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+    out: List[AdminJobRow] = []
+    keys = ["id", "decl_id", "file_id", "filename", "doc_key", "status", "attempts", "error_text", "created_at"]
+    for r in rows:
+        d = as_dict(r, keys)
+        out.append(
+            AdminJobRow(
+                id=int(d["id"]),
+                decl_id=int(d["decl_id"]),
+                file_id=int(d["file_id"]),
+                filename=(d.get("filename") or ""),  
+                doc_key=d.get("doc_key"),
+                status=d.get("status") or "",
+                attempts=d.get("attempts"),
+                error_text=d.get("error_text"),
+                created_at=d.get("created_at"),
+            )
+        )
+    return out
+
+
+@admin_router.get("/jobs/{job_id}", response_model=AdminJobDetails)
+def admin_job_details(job_id: int, current=Depends(require_admin)):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT j.id, j.decl_id, j.file_id, f.filename, j.doc_key, j.status, j.attempts, j.error_text, j.created_at
+            FROM jobs j
+            LEFT JOIN files f ON f.id = j.file_id
+            WHERE j.id = %s
+            """,
+            (job_id,),
+        )
+        r = cur.fetchone()
+        cur.close()
+
+    if not r:
+        api_error(404, "JOB_NOT_FOUND", "Задача не найдена", details={"job_id": int(job_id)})
+
+    d = as_dict(r, ["id","decl_id","file_id","filename","doc_key","status","attempts","error_text","created_at"])
+    return AdminJobDetails(
+        id=int(d["id"]),
+        decl_id=int(d["decl_id"]),
+        file_id=int(d["file_id"]),
+        filename=(d.get("filename") or ""),
+        doc_key=d.get("doc_key"),
+        status=d.get("status") or "",
+        attempts=d.get("attempts"),
+        error_text=d.get("error_text"),
+        created_at=d.get("created_at"),
+    )
+
+@admin_router.get("/jobs/{job_id}/result")
+def admin_job_result(job_id: int, current=Depends(require_admin)):
+    row = jobs_get(job_id)
+    if not row:
+        raise HTTPException(404, "Job not found")
+
+    status = row.get("status") or ""
+    decl_id = row.get("decl_id")
+    doc_key = row.get("doc_key") or ""
+    result = row.get("result_json")
+
+    if (result is None) and (status == "done") and decl_id and doc_key:
+        dk = f"{doc_key}_json"
+        linked = list_declaration_files(int(decl_id)) or []
+        file_id = None
+        for r in linked:
+            if str(r.get("doc_key") or "") == dk:
+                file_id = r.get("file_id")
+                break
+
+        if file_id:
+            rec = get_file(int(file_id))
+            if rec and rec.get("file_data"):
+                try:
+                    raw = rec["file_data"]
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode("utf-8", errors="replace")
+                    result = json.loads(raw)
+                except Exception:
+                    # если файл невалидный JSON — вернём как текст
+                    result = {"_error": "invalid_json_file", "raw": raw}
+
+    return {
+        "job_id": row.get("id"),
+        "decl_id": decl_id,
+        "doc_key": doc_key,
+        "status": status,
+        "result": result,
+    }
+
+@admin_router.get("/metrics", response_model=AdminMetricsOut)
+def admin_metrics(current=Depends(require_admin)):
+    now = datetime.now(APP_TZ)
+    since_24h = now - timedelta(hours=24)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # JOBS: статус за 24ч
+        cur.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM jobs
+            WHERE created_at >= %s
+            GROUP BY status
+            """,
+            (since_24h,),
+        )
+        jobs_rows = cur.fetchall() or []
+        jobs_24h = {str(s): int(c) for (s, c) in jobs_rows}
+
+        # JOBS: среднее время выполнения (если есть finished_at/started_at — лучше по ним)
+        # Если у тебя нет started_at/finished_at в jobs — можно пока оценивать по created_at->updated_at (если есть).
+        # Я даю безопасный вариант: если колонки нет — вернётся 0.
+        jobs_avg_seconds = 0.0
+        try:
+            cur.execute(
+                """
+                SELECT AVG(EXTRACT(EPOCH FROM (updated_at - created_at)))
+                FROM jobs
+                WHERE created_at >= %s AND status IN ('done','error') AND updated_at IS NOT NULL
+                """,
+                (since_24h,),
+            )
+            v = cur.fetchone()
+            jobs_avg_seconds = float(v[0] or 0.0)
+        except Exception:
+            jobs_avg_seconds = 0.0
+
+        # TNVED: запросов за 24ч, unknown, avg latency
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) as cnt,
+              SUM(CASE WHEN (result_json->>'code') = 'UNKNOWN' THEN 1 ELSE 0 END) as unknown_cnt,
+              AVG(COALESCE(latency_ms, 0)) as avg_latency
+            FROM tnved_requests
+            WHERE created_at >= %s
+            """,
+            (since_24h,),
+        )
+        r = cur.fetchone() or (0, 0, 0)
+        tnved_cnt = int(r[0] or 0)
+        tnved_unknown = int(r[1] or 0)
+        tnved_avg_latency = int(float(r[2] or 0))
+
+        # PAYMENTS: статус за 24ч
+        cur.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM payments
+            WHERE created_at >= %s
+            GROUP BY status
+            """,
+            (since_24h,),
+        )
+        p_rows = cur.fetchall() or []
+        payments_24h = {str(s): int(c) for (s, c) in p_rows}
+
+        # Последний успешный платеж
+        last_succ = None
+        try:
+            cur.execute(
+                """
+                SELECT paid_at
+                FROM payments
+                WHERE status = 'succeeded' AND paid_at IS NOT NULL
+                ORDER BY paid_at DESC
+                LIMIT 1
+                """
+            )
+            rr = cur.fetchone()
+            if rr and rr[0]:
+                last_succ = rr[0].isoformat()
+        except Exception:
+            last_succ = None
+
+        cur.close()
+
+    return AdminMetricsOut(
+        jobs_24h=jobs_24h,
+        jobs_avg_seconds_24h=jobs_avg_seconds,
+        tnved_requests_24h=tnved_cnt,
+        tnved_unknown_24h=tnved_unknown,
+        tnved_avg_latency_ms_24h=tnved_avg_latency,
+        payments_24h=payments_24h,
+        last_payment_succeeded_at=last_succ,
+    )
+
+
+@admin_router.get("/payments", response_model=List[AdminPaymentRow])
+def admin_payments(
+    user_id: int = 0,
+    order_id: int = 0,
+    provider_payment_id: str = "",
+    status: str = "",
+    limit: int = 100,
+    offset: int = 0,
+    current=Depends(require_admin),
+):
+    where = []
+    params: List[Any] = []
+
+    if user_id:
+        where.append("user_id = %s")
+        params.append(int(user_id))
+    if order_id:
+        where.append("id = %s")
+        params.append(int(order_id))
+    if provider_payment_id:
+        where.append("provider_payment_id = %s")
+        params.append(provider_payment_id)
+    if status:
+        where.append("status = %s")
+        params.append(status)
+
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    params.extend([limit, offset])
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT id, user_id, provider, provider_payment_id, tariff_plan_id,
+                   amount_value, currency, status, paid_at, created_at
+            FROM payments
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall() or []
+        cur.close()
+
+    out = []
+    keys = ["id","user_id","provider","provider_payment_id","tariff_plan_id","amount_value","currency","status","paid_at","created_at"]
+    for r in rows:
+        d = as_dict(r, keys)
+        out.append(AdminPaymentRow(
+            id=int(d["id"]),
+            user_id=int(d["user_id"]),
+            provider=d.get("provider") or "yookassa",
+            provider_payment_id=d.get("provider_payment_id"),
+            tariff_plan_id=d.get("tariff_plan_id"),
+            amount_value=str(d.get("amount_value") or ""),
+            currency=str(d.get("currency") or "RUB"),
+            status=str(d.get("status") or ""),
+            paid_at=d["paid_at"].isoformat() if d.get("paid_at") else None,
+            created_at=d["created_at"].isoformat() if d.get("created_at") else None,
+        ))
+    return out
+
+
+@admin_router.post("/payments/{order_id}/sync")
+async def admin_payment_sync(order_id: int, current=Depends(require_admin)):
+    p = payments_get_by_id(order_id)  # если нет — сделай аналог в db.py
+    if not p:
+        api_error(404, "ORDER_NOT_FOUND", "Заказ не найден", details={"order_id": int(order_id)})
+
+    provider_pid = p.get("provider_payment_id")
+    if not provider_pid:
+        api_error(400, "PAYMENT_NO_PROVIDER_ID", "У заказа нет provider_payment_id", details={"order_id": int(order_id)})
+
+    yk = await yk_request("GET", f"/payments/{provider_pid}")
+    new_status = yk.get("status") or (p.get("status") or "pending")
+
+    paid_at = datetime.now(APP_TZ) if new_status == "succeeded" else None
+    updated = payments_update_status_by_provider_id(provider_pid, new_status, yk, paid_at=paid_at)
+    if not updated:
+        return {"ok": True, "ignored": True, "status": new_status}
+
+    if new_status == "succeeded":
+        uid = int(updated["user_id"])
+        tariff_code = (yk.get("metadata") or {}).get("tariff_code", "") or ""
+        tariff = get_tariff_plan_by_code(tariff_code) if tariff_code else None
+        if tariff:
+            credits_apply_purchase(
+                user_id=uid,
+                payment_id=int(updated["id"]),
+                credits=int(tariff["credits"]),
+                meta={"source": "admin_sync"},
+            )
+
+    return {"ok": True, "order_id": int(order_id), "status": new_status}
+
+@admin_router.get("/users/{user_id}/credits/ledger", response_model=List[AdminLedgerRow])
+def admin_credits_ledger(user_id: int, limit: int = 200, offset: int = 0, current=Depends(require_admin)):
+    rows = credits_ledger_list(user_id=int(user_id), limit=limit, offset=offset)  # добавим в db.py если нет
+    out = []
+    for r in rows or []:
+        rr = dict(r)
+        if rr.get("created_at") is not None:
+            rr["created_at"] = rr["created_at"].isoformat()
+        out.append(rr)
+    return out
+
+@admin_router.post("/users/{user_id}/credits/adjust")
+def admin_credits_adjust(user_id: int, body: AdminCreditsAdjustIn, current=Depends(require_admin)):
+    amt = int(body.amount)
+    if amt == 0:
+        api_error(400, "AMOUNT_ZERO", "Сумма изменения должна быть ненулевой", details={})
+
+    credits_consume(
+        user_id=int(user_id),
+        amount=-amt if amt < 0 else 0,  # если у тебя credits_consume только списывает — лучше сделать отдельный db-функционал
+        ref_type="manual_adjustment",
+        ref_id=None,
+        meta={"reason": body.reason or "", "admin_id": int(current["id"])},
+    )
+
+    # Лучше: отдельная функция credits_add_manual(user_id, amount) которая пишет в ledger + пересчет баланса.
+    # Если у тебя уже есть credits_apply_purchase/credits_consume — скажи, я подстрою под твою схему.
+
+    return {"ok": True, "user_id": int(user_id), "amount": amt}
+
+######################## ЮKASSA ########################
+
+import uuid
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Dict, Optional
+from fastapi import Request
+
+YOOKASSA_BASE = "https://api.yookassa.ru/v3"
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
+YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "")  
+YOOKASSA_WEBHOOK_TOKEN = os.getenv("YOOKASSA_WEBHOOK_TOKEN", "")
+
+if APP_ENV == "prod":
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET is required in prod")
+    if not YOOKASSA_WEBHOOK_TOKEN:
+        raise RuntimeError("YOOKASSA_WEBHOOK_TOKEN is required in prod")
+
+def _require_yookassa_config():
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        api_error(
+            500,
+            "YOOKASSA_CONFIG_MISSING",
+            "YooKassa не настроена на сервере.",
+            hint="Проверьте YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY.",
+            details={},
+        )
+
+def _money_str(value: Decimal) -> str:
+    q = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{q:.2f}"
+
+def _append_query(url: str, key: str, value: str) -> str:
+    if "?" in url:
+        return f"{url}&{key}={value}"
+    return f"{url}?{key}={value}"
+
+async def yk_request(
+    method: str,
+    path: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    idempotence_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    _require_yookassa_config()
+    headers = {"Content-Type": "application/json"}
+    if idempotence_key:
+        headers["Idempotence-Key"] = idempotence_key
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.request(
+                method=method,
+                url=f"{YOOKASSA_BASE}{path}",
+                auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY), 
+                headers=headers,
+                json=json_body,
+            )
+    except Exception as e:
+        api_error(
+            502,
+            "YOOKASSA_UNAVAILABLE",
+            "YooKassa недоступна",
+            hint="Повторите попытку позже.",
+            details={"reason": str(e)},
+        )
+
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"error": r.text}
+        api_error(
+            int(r.status_code),
+            "YOOKASSA_HTTP_ERROR",
+            "Ошибка YooKassa",
+            hint="Проверьте параметры платежа и настройки магазина.",
+            details={"yookassa_error": err},
+    )
+
+    return r.json()
+
+
+
+@app.get("/tariffs")
+def api_list_tariffs():
+    return {"items": list_active_tariff_plans()}
+
+
+class CreatePaymentSimpleIn(BaseModel):
+    user_id: int
+    tariff_code: str
+
+class CreatePaymentSimpleOut(BaseModel):
+    order_id: int            
+    status: str
+    confirmation_url: Optional[str] = None
+    provider_payment_id: Optional[str] = None
+
+@app.post("/payments/create", response_model=CreatePaymentSimpleOut)
+async def create_payment_simple(body: CreatePaymentSimpleIn):
+    tariff = get_tariff_plan_by_code(body.tariff_code)
+    if not tariff:
+        api_error(
+            400,
+            "TARIFF_UNKNOWN",
+            "Неизвестный тариф",
+            hint="Обновите страницу тарифов и выберите тариф из списка.",
+            details={"tariff_code": body.tariff_code},
+        )
+
+    if not YOOKASSA_RETURN_URL:
+        api_error(
+            500,
+            "YOOKASSA_RETURN_URL_MISSING",
+            "Не настроен URL возврата YooKassa.",
+            hint="Укажите YOOKASSA_RETURN_URL (страница фронта /return).",
+            details={},
+        )
+
+    amount_value = _money_str(Decimal(tariff["price_rub"]))
+    currency = "RUB"
+
+    idem = str(uuid.uuid4())
+
+    p = payments_create_pending(
+        user_id=body.user_id,
+        tariff_plan_id=int(tariff["id"]),
+        amount_value=amount_value,
+        currency=currency,
+        idempotence_key=idem,
+        raw_json={"stage": "created_in_db", "tariff_code": body.tariff_code},
+    )
+    order_id = int(p["id"])
+    return_url = _append_query(YOOKASSA_RETURN_URL, "order_id", str(order_id))
+
+    payload: Dict[str, Any] = {
+        "amount": {"value": amount_value, "currency": currency},
+        "confirmation": {"type": "redirect", "return_url": return_url},
+        "capture": True,
+        "description": f"Покупка тарифа {tariff['title']} (order #{order_id})",
+        "metadata": {
+            "order_id": str(order_id),
+            "user_id": str(body.user_id),
+            "tariff_code": str(body.tariff_code),
+        },
+    }
+
+    yk = await yk_request("POST", "/payments", json_body=payload, idempotence_key=idem)
+
+    provider_payment_id = yk.get("id")
+    conf = (yk.get("confirmation") or {})
+    confirmation_url = conf.get("confirmation_url")
+
+    if not provider_payment_id or not confirmation_url:
+        api_error(
+            502,
+            "YOOKASSA_BAD_RESPONSE",
+            "YooKassa не вернула необходимые поля",
+            hint="Повторите попытку позже.",
+            details={"provider_payment_id": provider_payment_id, "confirmation_url": confirmation_url},
+        )
+    
+    payments_set_provider_payment_id(order_id, provider_payment_id, yk)
+
+    return CreatePaymentSimpleOut(
+        order_id=order_id,
+        status=yk.get("status") or "pending",
+        confirmation_url=confirmation_url,
+        provider_payment_id=provider_payment_id,
+    )
+
+class PaymentStatusOut(BaseModel):
+    order_id: int
+    status: str
+    paid: bool = False
+    confirmation_url: Optional[str] = None
+    credits_added: int
+    price_rub: int
+    tariff_code: str
+    credits_balance: int
+
+@app.get("/payments/orders/{order_id}", response_model=PaymentStatusOut)
+async def get_order_status(order_id: int, user_id: int = Query(...)):
+    p = payments_get_by_id_and_user(order_id, user_id)
+    if not p:
+        api_error(404, "ORDER_NOT_FOUND", "Заказ не найден", hint="Проверьте номер заказа.", details={"order_id": int(order_id), "user_id": int(user_id)})
+
+    provider_pid = p.get("provider_payment_id")
+    status = p.get("status") or "pending"
+
+    yk = None
+    if provider_pid and status in ("pending", "waiting_for_capture"):
+        yk = await yk_request("GET", f"/payments/{provider_pid}")
+        new_status = yk.get("status") or status
+        if new_status != status:
+            paid_at = datetime.now(APP_TZ) if new_status == "succeeded" else None
+            updated = payments_update_status_by_provider_id(provider_pid, new_status, yk, paid_at=paid_at)
+            if updated:
+                p = updated
+                status = new_status
+
+                if status == "succeeded":
+                    tariff = get_tariff_plan_by_code((yk.get("metadata") or {}).get("tariff_code", "") or "")
+                    if tariff:
+                        credits_apply_purchase(
+                            user_id=user_id,
+                            payment_id=order_id,
+                            credits=int(tariff["credits"]),
+                            meta={"source": "status_sync"},
+                        )
+
+    raw = yk or (p.get("raw_json") or {})
+    paid = bool(raw.get("paid", False))
+    confirmation_url = ((raw.get("confirmation") or {}).get("confirmation_url")) or None
+
+    tariffs = list_active_tariff_plans()
+    t = next((x for x in tariffs if int(x["id"]) == int(p.get("tariff_plan_id") or 0)), None)
+    if not t:
+        t = {"code": "unknown", "price_rub": int(Decimal(p["amount_value"])), "credits": 0}
+
+    balance = credits_get_balance(user_id)
+
+    return PaymentStatusOut(
+        order_id=order_id,
+        status=status,
+        paid=paid,  # NEW
+        confirmation_url=confirmation_url,  # NEW
+        credits_added=int(t["credits"]),
+        price_rub=int(t["price_rub"]),
+        tariff_code=str(t["code"]),
+        credits_balance=int(balance),
+    )
+
+
+@app.post("/yookassa/webhook")
+async def yookassa_webhook(request: Request):
+    token_q = request.query_params.get("token")
+    token_h = request.headers.get("X-Webhook-Token")
+
+    if YOOKASSA_WEBHOOK_TOKEN:
+        if token_q != YOOKASSA_WEBHOOK_TOKEN and token_h != YOOKASSA_WEBHOOK_TOKEN:
+            api_error(
+                401,
+                "WEBHOOK_INVALID_TOKEN",
+                "Неверный токен вебхука",
+                hint="Проверьте YOOKASSA_WEBHOOK_TOKEN и настройки вебхука.",
+                details={"token_q_present": bool(token_q), "token_h_present": bool(token_h)},
+            )
+
+    payload = await request.json()
+
+    event = payload.get("event") 
+    obj = payload.get("object") or {}
+    provider_payment_id = obj.get("id")
+    status = obj.get("status") or ""
+
+    if not provider_payment_id:
+        api_error(
+            400,
+            "WEBHOOK_NO_PAYMENT_ID",
+            "В вебхуке отсутствует payment id",
+            hint="Проверьте структуру webhook payload от YooKassa.",
+            details={"event": event},
+        )
+
+    yk_actual = await yk_request("GET", f"/payments/{provider_payment_id}")
+    actual_status = yk_actual.get("status") or status
+
+    paid_at = datetime.now(APP_TZ) if actual_status == "succeeded" else None
+    updated = payments_update_status_by_provider_id(provider_payment_id, actual_status, yk_actual, paid_at=paid_at)
+
+    if not updated:
+        return {"ok": True, "ignored": True}
+
+    if actual_status == "succeeded":
+        order_id = int(updated["id"])
+        user_id = int(updated["user_id"])
+
+        tariffs = list_active_tariff_plans()
+        t = next((x for x in tariffs if int(x["id"]) == int(updated.get("tariff_plan_id") or 0)), None)
+        if t:
+            credits_apply_purchase(
+                user_id=user_id,
+                payment_id=order_id,
+                credits=int(t["credits"]),
+                meta={"source": "webhook", "event": event},
+            )
+
+    return {"ok": True, "event": event, "provider_payment_id": provider_payment_id, "status": actual_status}
+
+
+class CreditsStatusOut(BaseModel):
+    credits_remaining: int
+    free_credits_remaining: int = 0
+    days_left: int
+
+@app.get("/credits/status", response_model=CreditsStatusOut)
+def credits_status(user_id: int = Query(...), current=Depends(get_current_user)):
+    require_owner(int(user_id), current)
+
+
+    u = get_user_by_id(user_id)
+    if not u:
+        api_error(404, "USER_NOT_FOUND", "Пользователь не найден", details={"user_id": int(user_id)})
+
+
+    s = credits_get_status(int(user_id))
+    return CreditsStatusOut(
+        credits_remaining=int(s.get("credits_remaining") or 0),
+        free_credits_remaining=int(u.get("free_credits_remaining") or 0),
+        days_left=int(s.get("days_left") or 0),
+    )
+
 
 
 
@@ -4419,63 +6165,6 @@ def compute_g44(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
         "g44_5_list": parts.get("dates_iso", []) or []
     }
 
-# def compute_g45(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
-#     from graph import get_brutto, get_brutto_sum, _to_decimal
-
-#     tnved_list = _collect_tnved_list(all_data) or []
-#     target_len = len(tnved_list)
-#     over_list = overrides.get("g45_1_list")
-#     if isinstance(over_list, (list, tuple)):
-#         vals = [("" if v in (None, "") else str(v).strip()) for v in over_list]
-#         if len(vals) < target_len:
-#             vals += [""] * (target_len - len(vals))
-#         elif len(vals) > target_len:
-#             vals = vals[:target_len]
-#         return {"g45_1_list": vals}
-
-#     g12_1_str = overrides.get("g12_1")
-#     if not g12_1_str:
-#         try:
-#             base12 = compute_g12(all_data, overrides) 
-#             g12_1_str = base12.get("g12_1") or ""
-#         except Exception:
-#             g12_1_str = ""
-
-#     total_value = _to_decimal(g12_1_str)
-#     if total_value <= Decimal("0"):
-#         return {"g45_1_list": [""] * target_len}
-
-#     try:
-#         brutto_map = get_brutto(all_data) or {}
-#     except Exception:
-#         brutto_map = {}
-
-#     try:
-#         total_brutto = get_brutto_sum(all_data)
-#     except Exception:
-#         total_brutto = 0.0
-
-#     total_brutto_dec = _to_decimal(total_brutto)
-#     if total_brutto_dec <= Decimal("0"):
-#         return {"g45_1_list": [""] * target_len}
-
-#     result: List[str] = []
-#     for code in tnved_list:
-#         item_brutto_dec = _to_decimal(brutto_map.get(code))
-#         if item_brutto_dec <= Decimal("0"):
-#             result.append("")
-#             continue
-#         try:
-#             item_value = (total_value * item_brutto_dec / total_brutto_dec).quantize(
-#                 Decimal("0.01")
-#             )
-#             result.append(str(item_value))
-#         except Exception:
-#             result.append("")
-
-#     return {
-#         "g45_1_list": result,
-#     }
 
 def compute_g45(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     from decimal import Decimal
@@ -4636,107 +6325,6 @@ def compute_g46(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str
         "g46_1_list": result,
     }
 
-# def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
-#     from graph import get_currency, _to_decimal, get_any
-#     from parser_cbrf import cb_rate
-#     from decimal import Decimal
-
-#     def _d(val) -> Decimal:
-#         try:
-#             return _to_decimal(val)
-#         except Exception:
-#             return Decimal("0")
-#     over_goods = overrides.get("goods_by_tnved")
-#     tnved_filter = str(overrides.get("goods_tnved_filter") or "").strip()
-
-#     if isinstance(over_goods, dict) and over_goods:
-#         goods_by_tnved: Dict[str, List[Dict[str, Any]]] = over_goods
-#         if tnved_filter:
-#             filtered: Dict[str, List[Dict[str, Any]]] = {}
-#             for code, items in goods_by_tnved.items():
-#                 if code.startswith(tnved_filter):
-#                     filtered[code] = items
-#             goods_by_tnved = filtered
-
-#         return {"goods_by_tnved": goods_by_tnved}
-
-#     invoice = (
-#         all_data.get("invoice")
-#         or all_data.get("invoice_json")
-#         or all_data.get("invoice_parsed")
-#         or {}
-#     )
-
-#     goods_src = None
-#     if isinstance(invoice, dict):
-#         goods_src = (
-#             invoice.get("Товары")
-#             or invoice.get("goods")
-#             or invoice.get("items")
-#         )
-
-#     if not isinstance(goods_src, list):
-#         return {"goods_by_tnved": {}}
-
-#     goods_by_tnved: Dict[str, List[Dict[str, Any]]] = {}
-
-#     for idx, g in enumerate(goods_src):
-#         if not isinstance(g, dict):
-#             continue
-
-#         code = str(g.get("Код ТНВЭД") or "").strip()
-#         if not code:
-#             continue
-
-#         name = g.get("Наименование") or ""
-#         manufacturer = (invoice.get("Отправитель").get("Название компании") or "")
-#         trademark = (g.get("Товарный знак") or "")
-#         goods_mark = g.get("Марка") or "ОТСУТСТВУЕТ"
-#         goods_model = g.get("Модель") or "ОТСУТСТВУЕТ"
-#         goods_marking = g.get("Артикул") or "ОТСУТСТВУЕТ"
-
-#         qty = g.get("Количество") or ""
-
-#         currency = g.get("Валюта") or ""
-#         if currency == "null":
-#             currency = ""
-
-#         price = _d(g.get("Цена"))
-#         qty_dec = _d(qty)
-#         invoiced_cost = _d(g.get("Стоимость"))
-
-#         if invoiced_cost <= 0:
-#             invoiced_cost = price * qty_dec
-
-
-#         item = {
-#             "index": idx,
-#             "tnved": code,
-#             "name": name,
-#             "manufacturer": manufacturer,
-#             "goods_trademark": trademark,
-#             "goods_mark": goods_mark,
-#             "goods_model": goods_model,
-#             "goods_marking": goods_marking,
-#             "qty": str(qty),
-#             "currency": currency,
-#             "invoiced_cost": str(invoiced_cost) if invoiced_cost != 0 else "",
-#         }
-
-#         goods_by_tnved.setdefault(code, []).append(item)
-
-#     tnved_filter = str(overrides.get("goods_tnved_filter") or "").strip()
-#     if tnved_filter:
-#         filtered: Dict[str, List[Dict[str, Any]]] = {}
-#         for code, items in goods_by_tnved.items():
-#             if code.startswith(tnved_filter):
-#                 filtered[code] = items
-#         goods_by_tnved = filtered
-
-#     return {
-#         "goods_by_tnved": goods_by_tnved,
-#     }
-
 def compute_goods(all_data: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     from graph import get_currency, _to_decimal, get_any
     from parser_cbrf import cb_rate
@@ -4896,16 +6484,32 @@ class GraphsOut(BaseModel):
 class GraphsUpdateIn(BaseModel):
     changes: Dict[str, Any]
 
-@app.get("/v1/declarations/{decl_id}/graphs", response_model=GraphsOut)
-def api_get_graphs(decl_id: int):
+@decl_router.get("/{decl_id}/graphs", response_model=GraphsOut)
+def api_get_graphs(decl_id: int, current=Depends(get_current_user)):
+    owner_id = int(get_declaration_user_id(int(decl_id)) or 0)
+    if owner_id != int(current["id"]) and ((current.get("role") or "user") != "admin"):
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете отвязывать файлы только у своих таможенных деклараций.",
+            details={"decl_id": int(decl_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+    require_declarant_access(current)
     all_data = build_all_data_for_decl(decl_id)
     overrides = get_overrides(decl_id)
     graphs = compute_graphs(all_data, overrides)
     graphs["document_id"] = f"declaration_{str(decl_id)}"
     return GraphsOut(graphs=graphs)
 
-@app.post("/v1/declarations/{decl_id}/graphs", response_model=GraphsOut)
-def api_update_graphs(decl_id: int, body: GraphsUpdateIn):
+@decl_router.post("/{decl_id}/graphs", response_model=GraphsOut)
+def api_update_graphs(decl_id: int, body: GraphsUpdateIn, current=Depends(get_current_user)):
+    owner_id = int(get_declaration_user_id(int(decl_id)) or 0)
+    if owner_id != int(current["id"]) and ((current.get("role") or "user") != "admin"):
+        raise HTTPException(403, "Forbidden (not your declaration)")
+
+    require_declarant_access(current)
     all_data = build_all_data_for_decl(decl_id)
     overrides = get_overrides(decl_id) or {}
     changes = body.changes or {}
@@ -4928,13 +6532,19 @@ def api_update_graphs(decl_id: int, body: GraphsUpdateIn):
     graphs["document_id"] = f"declaration_{decl_id}"
     return GraphsOut(graphs=graphs)
 
-@app.get("/v1/graphs/g30/by-tp")
+@graphs_router.get("/g30/by-tp")
 def api_compute_g30_by_tp(tp_code: str):
     try:
       result = compute_g30(all_data={}, overrides={"g30_3": tp_code})
       return result
     except Exception as e:
-      raise HTTPException(status_code=500, detail=str(e))
+        api_error(
+            500,
+            "GRAPH_BUILD_FAILED",
+            "Не удалось построить график.",
+            hint="Попробуйте позже. Если повторяется — сообщите request_id в поддержку.",
+            details={"reason": str(e)},
+        )
     
 def _split_250(s: Any) -> List[str]:
     s = "" if s is None else str(s)
@@ -5318,8 +6928,20 @@ def _payload_from_graphs(graphs: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-@app.get("/v1/declarations/{decl_id}/xml")
-def api_get_declaration_xml(decl_id: int):
+@decl_router.get("/{decl_id}/xml")
+def api_get_declaration_xml(decl_id: int, current=Depends(get_current_user)):
+    owner_id = int(get_declaration_user_id(int(decl_id)) or 0)
+    if owner_id != int(current["id"]) and _norm_role(current) != "admin":
+        api_error(
+            403,
+            "FORBIDDEN_NOT_OWNER",
+            "Доступ запрещён",
+            hint="Вы можете выгружать XML только для своих таможенных деклараций.",
+            details={"decl_id": int(decl_id), "owner_id": owner_id, "current_user_id": int(current["id"])},
+        )
+
+
+    require_declarant_access(current)
     try:
         all_data = build_all_data_for_decl(decl_id)
         overrides = get_overrides(decl_id) or {}
@@ -5360,4 +6982,24 @@ def api_get_declaration_xml(decl_id: int):
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        api_error(
+            500,
+            "XML_GENERATION_FAILED",
+            "Не удалось сформировать XML.",
+            hint="Проверьте заполнение данных. Если ошибка повторяется — сообщите request_id в поддержку.",
+            details={"decl_id": int(decl_id), "reason": str(e)},
+        )
+    
+
+app.include_router(auth_router)
+app.include_router(users_router)
+app.include_router(decl_router)
+app.include_router(jobs_router)
+app.include_router(admin_router)
+
+app.include_router(files_router)
+app.include_router(company_router)
+app.include_router(tnved_router)
+app.include_router(graphs_router)
+app.include_router(debug_router)
+app.include_router(misc_router)
